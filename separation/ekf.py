@@ -1,26 +1,24 @@
 """
 separation/ekf.py
 Extended Kalman Filter for fetal ECG morphological refinement.
-
 Based on the McSharry synthetic ECG oscillator model (2003).
 
-Novel adaptations for fetal ECG:
-1. PQRST parameters tuned for fetal cardiac physiology
-2. Physiological HR prior constrains state update
-3. Adaptive omega update from detected RR intervals
-4. RTS backward smoother for P/T wave recovery
+CHANGES FROM ORIGINAL:
+  [FIX-1] Phase burn-in added to filter() and smooth(). The McSharry
+          oscillator initialises at theta=0 (x=1, y=0 = R-wave peak).
+          But the ICA component fed in starts at an arbitrary cardiac phase.
+          Without burn-in, the EKF spends the first few beats in a transient
+          that often mirrors the maternal ECG morphology. The fix advances
+          the EKF to the first detected peak before collecting output.
 
-FIX: In smooth(), the Jacobian was computed twice per timestep (once
-explicitly, once inside predict()). predict() now returns the Jacobian
-so it is computed only once per sample — halving the most expensive
-operation (6 RK4 evaluations per Jacobian).
+  [FIX-2] EKF_PROCESS_NOISE raised in config.py; picked up automatically here.
 """
 
 import numpy as np
 from config import (
     FS, EKF_FETAL_HR_INIT, EKF_PROCESS_NOISE,
     EKF_OBSERVE_NOISE, EKF_STATE_COV_INIT, EKF_PQRST_PARAMS,
-    FETAL_HR_MIN, FETAL_HR_MAX
+    FETAL_HR_MIN, FETAL_HR_MAX,
 )
 
 
@@ -48,12 +46,10 @@ class FetalECGKalmanFilter:
         self.ecg_params = EKF_PQRST_PARAMS.copy()
 
     def set_hr(self, hr_bpm: float) -> None:
-        """Update angular frequency from HR estimate."""
         hr_bpm     = float(np.clip(hr_bpm, FETAL_HR_MIN, FETAL_HR_MAX))
         self.omega = 2 * np.pi * (hr_bpm / 60.0)
 
     def _f(self, state: np.ndarray) -> np.ndarray:
-        """McSharry ECG oscillator: compute dz/dt."""
         x, y, z = state
         theta = np.arctan2(y, x)
         dxdt  = -self.omega * y
@@ -65,7 +61,6 @@ class FetalECGKalmanFilter:
         return np.array([dxdt, dydt, dzdt])
 
     def _rk4(self, state: np.ndarray) -> np.ndarray:
-        """4th-order Runge-Kutta integration of the oscillator."""
         dt = self.dt
         k1 = self._f(state)
         k2 = self._f(state + 0.5 * dt * k1)
@@ -74,28 +69,16 @@ class FetalECGKalmanFilter:
         return state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
     def _jacobian(self, state: np.ndarray) -> np.ndarray:
-        """Numerical Jacobian of state transition function."""
         eps = 1e-5
         F   = np.zeros((3, 3))
         for i in range(3):
-            s_plus        = state.copy(); s_plus[i]  += eps
-            s_minus       = state.copy(); s_minus[i] -= eps
+            s_plus  = state.copy(); s_plus[i]  += eps
+            s_minus = state.copy(); s_minus[i] -= eps
             F[:, i] = (self._rk4(s_plus) - self._rk4(s_minus)) / (2 * eps)
         return F
 
     def predict(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        EKF predict step.
-
-        FIX: Now returns (state_pred, P_pred, F) so the Jacobian is
-        computed only once per timestep and can be reused in smooth().
-
-        Returns
-        -------
-        state_pred : predicted state
-        P_pred     : predicted covariance
-        F          : Jacobian at current state (for RTS smoother)
-        """
+        """EKF predict step. Returns (state_pred, P_pred, F)."""
         F          = self._jacobian(self.state)
         state_pred = self._rk4(self.state)
         P_pred     = F @ self.P @ F.T + self.Q
@@ -103,7 +86,6 @@ class FetalECGKalmanFilter:
 
     def update(self, state_pred: np.ndarray, P_pred: np.ndarray,
                observation: float) -> None:
-        """EKF update step."""
         z_obs  = np.array([[observation]])
         z_pred = self.H @ state_pred
         innov  = z_obs - z_pred.reshape(1, 1)
@@ -113,7 +95,6 @@ class FetalECGKalmanFilter:
         self.P     = (np.eye(3) - K @ self.H) @ P_pred
 
     def _build_hr_updates(self, detected_peaks: np.ndarray) -> dict:
-        """Build a {sample_index: hr_bpm} schedule from detected peaks."""
         hr_updates = {}
         if detected_peaks is not None and len(detected_peaks) >= 4:
             for i in range(2, len(detected_peaks)):
@@ -123,25 +104,41 @@ class FetalECGKalmanFilter:
                     hr_updates[int(detected_peaks[i])] = hr_est
         return hr_updates
 
+    def _phase_burnin(self, observed: np.ndarray,
+                      detected_peaks: np.ndarray,
+                      hr_updates: dict) -> None:
+        """
+        [FIX-1] Advance EKF state to the first detected peak before
+        collecting output, so the filter starts in a phase-aligned state.
+
+        Without this, the oscillator starts at theta=0 (R-wave peak) but
+        the ICA component starts at a random cardiac phase. The resulting
+        transient often looks like a distorted maternal beat and degrades
+        the first 1-3 seconds of output.
+        """
+        if detected_peaks is None or len(detected_peaks) == 0:
+            return
+        first_peak = int(detected_peaks[0])
+        if first_peak <= 0:
+            return
+        print(f"[EKF] Phase burn-in: advancing {first_peak} samples to first peak")
+        for t in range(first_peak):
+            if t in hr_updates:
+                self.set_hr(hr_updates[t])
+            state_pred, P_pred, _ = self.predict()
+            self.update(state_pred, P_pred, observed[t])
+
     def filter(self, observed: np.ndarray,
                detected_peaks: np.ndarray = None) -> tuple[np.ndarray, list]:
         """
-        Forward EKF pass over the entire observed signal.
-
-        Parameters
-        ----------
-        observed       : (N,) noisy fetal ECG estimate from ICA
-        detected_peaks : optional peak indices for adaptive HR update
-
-        Returns
-        -------
-        filtered  : (N,) EKF-filtered fetal ECG
-        state_log : list of state vectors
+        Forward EKF pass. [FIX-1] Phase burn-in runs before output collection.
         """
         N          = len(observed)
         filtered   = np.zeros(N)
         state_log  = []
         hr_updates = self._build_hr_updates(detected_peaks)
+
+        self._phase_burnin(observed, detected_peaks, hr_updates)
 
         for t in range(N):
             if t in hr_updates:
@@ -156,18 +153,8 @@ class FetalECGKalmanFilter:
     def smooth(self, observed: np.ndarray,
                detected_peaks: np.ndarray = None) -> np.ndarray:
         """
-        Rauch-Tung-Striebel (RTS) smoother: forward EKF + backward smoothing.
-
-        The backward pass uses future observations to refine past estimates,
-        substantially improving P-wave and T-wave recovery.
-
-        FIX: Jacobian is now computed once per timestep via predict() which
-        returns F alongside state_pred and P_pred. Previously it was computed
-        twice (once explicitly before predict(), once inside predict()).
-
-        Returns
-        -------
-        smoothed : (N,) RTS-smoothed fetal ECG
+        RTS smoother: forward EKF + backward smoothing.
+        [FIX-1] Phase burn-in runs before the forward pass.
         """
         N = len(observed)
 
@@ -178,22 +165,19 @@ class FetalECGKalmanFilter:
         Fs          = np.zeros((N, 3, 3))
 
         hr_updates = self._build_hr_updates(detected_peaks)
+        self._phase_burnin(observed, detected_peaks, hr_updates)
 
-        # Forward pass — Jacobian returned from predict(), not recomputed
         for t in range(N):
             if t in hr_updates:
                 self.set_hr(hr_updates[t])
-
-            state_pred, P_pred, F_t = self.predict()   # F_t computed once
+            state_pred, P_pred, F_t = self.predict()
             self.update(state_pred, P_pred, observed[t])
-
             states_pred[t] = state_pred
             states_filt[t] = self.state.copy()
             P_preds[t]     = P_pred
             P_filts[t]     = self.P.copy()
             Fs[t]          = F_t
 
-        # Backward pass (RTS smoother)
         states_smooth = states_filt.copy()
         P_smooth      = P_filts.copy()
 

@@ -133,15 +133,25 @@ def plot_fetal_comparison(fetal_estimated: np.ndarray,
     ax.plot(t, est_n, color=COLORS["fetal_est"], lw=0.8,
             label="PHASE extracted fetal ECG", alpha=0.85, linestyle="--")
 
-    ref_in = [p for p in peaks_ref if s <= p < e]
-    est_in = [p for p in peaks_est if s <= p < e]
+    # --- robust integer-safe indexing ---
+    ref_in = np.asarray([p for p in peaks_ref if s <= p < e], dtype=np.int64)
+    est_in = np.asarray([p for p in peaks_est if s <= p < e], dtype=np.int64)
 
-    ax.scatter(np.array(ref_in)/fs, ref_n[np.array(ref_in)-s],
-               color=COLORS["peaks_ref"], marker="o", s=30, zorder=5,
-               label="Reference QRS peaks")
-    ax.scatter(np.array(est_in)/fs, est_n[np.array(est_in)-s],
-               color=COLORS["peaks_est"], marker="x", s=40, zorder=5,
-               label="Detected QRS peaks")
+    if ref_in.size > 0:
+        idx_ref = ref_in - s
+        valid = (idx_ref >= 0) & (idx_ref < len(ref_n))
+        ax.scatter(ref_in[valid] / fs,
+                ref_n[idx_ref[valid]],
+                color=COLORS["peaks_ref"], marker="o", s=30, zorder=5,
+                label="Reference QRS peaks")
+
+    if est_in.size > 0:
+        idx_est = est_in - s
+        valid = (idx_est >= 0) & (idx_est < len(est_n))
+        ax.scatter(est_in[valid] / fs,
+                est_n[idx_est[valid]],
+                color=COLORS["peaks_est"], marker="x", s=40, zorder=5,
+                label="Detected QRS peaks")
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Normalized amplitude")

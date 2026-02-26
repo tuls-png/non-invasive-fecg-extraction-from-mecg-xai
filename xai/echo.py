@@ -4,23 +4,25 @@ ECHO: ECG Contribution Heatmap with Oscillator-space Attribution
 
 Novel XAI method for fetal ECG separation interpretability.
 
-Core idea: Instead of attributing separation decisions to raw signal
-features (as SHAP/LIME do), ECHO attributes to physiological parameters:
-  - Heart rate contrast between fetal and maternal
-  - Morphological consistency (QRS shape, duration)
-  - Temporal independence (fetal beat does not coincide with maternal beat)
+CHANGES FROM ORIGINAL:
+  [FIX-1] Morphological fidelity score (score_morph) is now explicitly disabled
+          and reported as NaN when no direct reference electrode is available
+          (NIFECGDB). Previously, pipeline.py passed fetal_ecg as both the
+          estimated signal AND the reference_signal when no direct electrode
+          existed, making _local_prd() compare the signal to itself. This gave
+          PRD=0 and morph_score=1.0 for every beat, artificially inflating
+          confidence scores and making the ECHO report misleading.
 
-This is clinically meaningful because a cardiologist can directly reason
-about "this beat was identified as fetal because its rate is 143 BPM
-(vs maternal 78 BPM)" — they cannot reason about raw SHAP feature values.
+          The fix: ECHOExplainer now accepts has_reference=True/False.
+          When has_reference=False:
+            - morph_scores are set to NaN (excluded from attribution)
+            - attribution is computed from HR contrast + temporal independence only
+            - the clinical report clearly states morphology was not assessed
+            - confidence is computed as geometric mean of available scores only
 
-Attribution formula (per beat b):
-  score_hr(b)   = |HR_fetal(b) - HR_maternal| / HR_maternal
-  score_indep(b) = min_distance_to_maternal_peak / threshold
-  score_morph(b) = 1 / (1 + PRD_local(b))  [local morphological fidelity]
-
-  Each score normalized to [0, 1].
-  Attribution(b) = [score_hr, score_indep, score_morph] / sum
+  [FIX-2] generate_summary_stats() and generate_clinical_report() now reflect
+          whether morphology was available, avoiding false clinical statements
+          like "morphological fidelity verified" when it was never checked.
 """
 
 import numpy as np
@@ -35,9 +37,9 @@ class ECHOExplainer:
     ECHO: Oscillator-space Attribution for Fetal ECG Separation.
 
     Instantiate once per recording, then call:
-      - compute_attributions()    → per-beat attribution dict
-      - generate_clinical_report()→ text explanation for one beat
-      - plot_attribution_heatmap()→ visual explanation figure
+      - compute_attributions()     -> per-beat attribution dict
+      - generate_clinical_report() -> text explanation for one beat
+      - plot_attribution_heatmap() -> visual explanation figure
     """
 
     def __init__(self,
@@ -45,8 +47,9 @@ class ECHOExplainer:
                  maternal_peaks: np.ndarray,
                  fetal_peaks: np.ndarray,
                  fetal_signal: np.ndarray,
-                 reference_signal: np.ndarray,
-                 ekf_states: list = None):
+                 reference_signal: np.ndarray | None,
+                 ekf_states: list = None,
+                 has_reference: bool = None):
         """
         Parameters
         ----------
@@ -54,21 +57,47 @@ class ECHOExplainer:
         maternal_peaks   : (K,) detected maternal R-peak indices
         fetal_peaks      : (M,) detected fetal R-peak indices
         fetal_signal     : (N,) extracted fetal ECG (EKF-smoothed)
-        reference_signal : (N,) direct fetal ECG (ground truth, for morphology score)
-        ekf_states       : list of EKF state vectors (optional, for future extension)
+        reference_signal : (N,) direct fetal ECG, or None for NIFECGDB.
+                           [FIX-1] If None, morphology scoring is disabled.
+        ekf_states       : list of EKF state vectors (optional)
+        has_reference    : explicit override. If None, inferred from whether
+                           reference_signal is not None AND differs from
+                           fetal_signal (guards against the old pattern of
+                           passing fetal_ecg as its own reference).
         """
-        self.fs               = fs
-        self.maternal_peaks   = np.asarray(maternal_peaks)
-        self.fetal_peaks      = np.asarray(fetal_peaks)
-        self.fetal_signal     = np.asarray(fetal_signal)
-        self.reference_signal = np.asarray(reference_signal)
-        self.ekf_states       = ekf_states
+        self.fs             = fs
+        self.maternal_peaks = np.asarray(maternal_peaks)
+        self.fetal_peaks    = np.asarray(fetal_peaks)
+        self.fetal_signal   = np.asarray(fetal_signal)
+        self.ekf_states     = ekf_states
+
+        # [FIX-1] Determine if a genuine external reference exists.
+        if has_reference is not None:
+            self.has_reference = has_reference
+        elif reference_signal is None:
+            self.has_reference = False
+        else:
+            ref = np.asarray(reference_signal)
+            # Detect the old self-referential pattern: if ref IS fetal_signal
+            # (same object or identical values), treat as no reference.
+            if ref is self.fetal_signal or np.array_equal(ref, self.fetal_signal):
+                self.has_reference = False
+                print("[ECHO] WARNING: reference_signal is identical to fetal_signal "
+                      "-- morphology scoring disabled (no independent reference).")
+            else:
+                self.has_reference = True
+
+        self.reference_signal = (np.asarray(reference_signal)
+                                 if reference_signal is not None and self.has_reference
+                                 else None)
 
         # Precompute HR series
-        self.maternal_hr = self._mean_hr(maternal_peaks)
+        self.maternal_hr           = self._mean_hr(maternal_peaks)
         self.fetal_hr_series, self.fetal_hr_mean = self._hr_series(fetal_peaks)
 
-    # ── Internal helpers ────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
 
     def _mean_hr(self, peaks: np.ndarray) -> float:
         if len(peaks) < 2:
@@ -85,11 +114,14 @@ class ECHOExplainer:
 
     def _local_prd(self, beat_idx: int, half_window: int = None) -> float:
         """
-        Compute local PRD (Percent Root Mean Difference) around a fetal beat.
-        Used as a proxy for morphological fidelity at that beat location.
+        Local PRD around a fetal beat.
+        [FIX-1] Returns NaN if no independent reference is available.
         """
+        if not self.has_reference or self.reference_signal is None:
+            return np.nan
+
         if half_window is None:
-            half_window = int(0.3 * self.fs)   # 300 ms window
+            half_window = int(0.3 * self.fs)
 
         if beat_idx >= len(self.fetal_peaks):
             return 1.0
@@ -107,21 +139,27 @@ class ECHOExplainer:
         prd = np.sqrt(np.sum((est - ref)**2) / (np.sum(ref**2) + 1e-12))
         return float(np.clip(prd, 0.0, 2.0))
 
-    # ── Attribution computation ─────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Attribution computation
+    # -------------------------------------------------------------------------
 
     def compute_attributions(self) -> dict:
         """
         Compute per-beat attribution scores for all detected fetal beats.
 
+        [FIX-1] When has_reference=False, morph_scores are NaN and attribution
+        is normalised over HR contrast + temporal independence only.
+
         Returns
         -------
         dict with keys:
-          beat_times        : (M,) time in seconds of each beat
+          beat_times        : (M,) time in seconds
           hr_attribution    : (M,) fraction attributed to HR contrast
-          morph_attribution : (M,) fraction attributed to morphology
+          morph_attribution : (M,) fraction attributed to morphology (NaN if unavailable)
           indep_attribution : (M,) fraction attributed to temporal independence
           hr_values         : (M,) instantaneous fetal HR per beat
           confidence        : (M,) overall confidence score [0,1]
+          has_morphology    : bool -- whether morph scores were computed
         """
         n_beats = len(self.fetal_peaks)
         if n_beats < 2:
@@ -129,13 +167,13 @@ class ECHOExplainer:
 
         hr_scores    = np.zeros(n_beats)
         indep_scores = np.zeros(n_beats)
-        morph_scores = np.zeros(n_beats)
+        morph_scores = np.full(n_beats, np.nan)   # NaN by default
         hr_values    = np.zeros(n_beats)
 
         excl_samples = int(ECHO_MATERNAL_EXCLUSION_SEC * self.fs)
 
         for i, fp in enumerate(self.fetal_peaks):
-            # ── HR contrast score ──────────────────────────────────────────
+            # HR contrast score
             if i < len(self.fetal_hr_series):
                 hr_f = float(self.fetal_hr_series[i])
             else:
@@ -148,7 +186,7 @@ class ECHOExplainer:
             else:
                 hr_scores[i] = 0.5
 
-            # ── Temporal independence score ────────────────────────────────
+            # Temporal independence score
             if len(self.maternal_peaks) > 0:
                 distances = np.abs(self.maternal_peaks - fp) / self.fs
                 min_dist  = float(np.min(distances))
@@ -158,18 +196,29 @@ class ECHOExplainer:
             else:
                 indep_scores[i] = 1.0
 
-            # ── Morphological fidelity score ───────────────────────────────
+            # [FIX-1] Morphological fidelity -- only when reference is available
             prd = self._local_prd(i)
-            morph_scores[i] = float(np.clip(1.0 / (1.0 + prd), 0.0, 1.0))
+            if not np.isnan(prd):
+                morph_scores[i] = float(np.clip(1.0 / (1.0 + prd), 0.0, 1.0))
 
-        # Normalize so attributions sum to 1 per beat
-        total = hr_scores + indep_scores + morph_scores + 1e-10
-        hr_attr    = hr_scores    / total
-        indep_attr = indep_scores / total
-        morph_attr = morph_scores / total
+        # Normalise attributions -- [FIX-1] exclude morph when not available
+        has_morphology = self.has_reference and not np.all(np.isnan(morph_scores))
 
-        # Overall confidence: geometric mean of raw scores
-        confidence = (hr_scores * indep_scores * morph_scores) ** (1.0/3.0)
+        if has_morphology:
+            morph_safe = np.where(np.isnan(morph_scores), 0.0, morph_scores)
+            total      = hr_scores + indep_scores + morph_safe + 1e-10
+            hr_attr    = hr_scores    / total
+            indep_attr = indep_scores / total
+            morph_attr = morph_safe   / total
+            confidence = (hr_scores * indep_scores * morph_safe) ** (1.0 / 3.0)
+        else:
+            total      = hr_scores + indep_scores + 1e-10
+            hr_attr    = hr_scores    / total
+            indep_attr = indep_scores / total
+            morph_attr = np.full(n_beats, np.nan)
+            # Confidence from 2 scores only
+            confidence = np.sqrt(hr_scores * indep_scores)
+
         confidence = np.clip(confidence, 0.0, 1.0)
 
         return {
@@ -180,110 +229,111 @@ class ECHOExplainer:
             "hr_values"         : hr_values,
             "confidence"        : confidence,
             "n_beats"           : n_beats,
+            "has_morphology"    : has_morphology,
         }
 
-    # ── Clinical report ─────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Clinical report
+    # -------------------------------------------------------------------------
 
     def generate_clinical_report(self, beat_idx: int,
                                  attribution: dict) -> str:
         """
         Generate a natural language clinical explanation for one fetal beat.
 
-        This is the core output of the ECHO XAI layer — designed for
-        physicians who need to understand WHY a beat was classified as fetal.
-
-        Parameters
-        ----------
-        beat_idx    : index of the beat to explain (0-indexed)
-        attribution : output of compute_attributions()
-
-        Returns
-        -------
-        str : formatted clinical report
+        [FIX-2] When has_morphology=False (NIFECGDB), the report clearly states
+        that morphological fidelity was not assessed rather than falsely claiming
+        it was verified.
         """
         if not attribution or beat_idx >= attribution["n_beats"]:
-            return "Insufficient data for explanation."
+            return "No attribution data for this beat."
 
-        hr_f    = float(attribution["hr_values"][beat_idx])
-        hr_attr = float(attribution["hr_attribution"][beat_idx]) * 100
-        mo_attr = float(attribution["morph_attribution"][beat_idx]) * 100
-        in_attr = float(attribution["indep_attribution"][beat_idx]) * 100
-        conf    = float(attribution["confidence"][beat_idx]) * 100
+        hr_attr  = float(attribution["hr_attribution"][beat_idx])  * 100
+        in_attr  = float(attribution["indep_attribution"][beat_idx]) * 100
+        mo_raw   = attribution["morph_attribution"][beat_idx]
+        mo_attr  = float(mo_raw) * 100 if not np.isnan(mo_raw) else np.nan
+        hr_f     = float(attribution["hr_values"][beat_idx])
+        conf     = float(attribution["confidence"][beat_idx]) * 100
+        has_morph = attribution.get("has_morphology", False)
 
-        # HR clinical interpretation
-        if 110 <= hr_f <= 160:
-            hr_status = "within normal fetal range [110–160 BPM]"
-            hr_flag   = "✓"
-        elif hr_f < 110:
-            hr_status = "⚠ BRADYCARDIA — below normal fetal range"
-            hr_flag   = "⚠"
+        if not np.isnan(self.maternal_hr):
+            hr_sep = abs(hr_f - self.maternal_hr)
+            if FETAL_HR_MIN <= hr_f <= FETAL_HR_MAX:
+                hr_flag   = "ok"
+                hr_status = f"NORMAL ({FETAL_HR_MIN}-{FETAL_HR_MAX} BPM range)"
+            else:
+                hr_flag   = "WARN"
+                hr_status = f"OUTSIDE normal range ({FETAL_HR_MIN}-{FETAL_HR_MAX} BPM)"
         else:
-            hr_status = "⚠ TACHYCARDIA — above normal fetal range"
-            hr_flag   = "⚠"
+            hr_sep    = np.nan
+            hr_flag   = "?"
+            hr_status = "Maternal HR unavailable for comparison"
 
-        # Primary separation cue
-        attrs = {"Heart Rate Contrast": hr_attr,
-                 "Morphological Consistency": mo_attr,
-                 "Temporal Independence": in_attr}
+        attrs = {"HR Contrast": hr_attr, "Temporal Independence": in_attr}
+        if has_morph and not np.isnan(mo_attr):
+            attrs["Morphology"] = mo_attr
         primary_cue = max(attrs, key=attrs.get)
 
+        morph_line = (
+            f"  Morphological Consistency  [{mo_attr:.1f}% attribution]\n"
+            f"     QRS shape verified against direct fetal electrode reference."
+            if has_morph and not np.isnan(mo_attr)
+            else
+            "  Morphological Consistency  [N/A -- no direct electrode reference]\n"
+            "     Cannot assess: NIFECGDB does not provide a reference waveform."
+        )
+
+        sep_str = f"{hr_sep:.1f} BPM" if not np.isnan(hr_sep) else "N/A"
+        mat_hr_str = f"{self.maternal_hr:.1f} BPM" if not np.isnan(self.maternal_hr) else "N/A"
+
         report = f"""
-╔══════════════════════════════════════════════════════════════╗
-  ECHO Clinical Explanation — Fetal Beat #{beat_idx + 1}
-╚══════════════════════════════════════════════════════════════╝
++--------------------------------------------------------------+
+  ECHO Clinical Explanation -- Fetal Beat #{beat_idx + 1}
++--------------------------------------------------------------+
 
   OVERALL CONFIDENCE: {conf:.1f}%
 
   SEPARATION RATIONALE:
-  ─────────────────────────────────────────────────────────────
-  {hr_flag} Heart Rate Contrast        [{hr_attr:.1f}% attribution]
+  --------------------------------------------------------------
+  [{hr_flag}] Heart Rate Contrast        [{hr_attr:.1f}% attribution]
      Instantaneous fetal HR = {hr_f:.1f} BPM
      Status: {hr_status}
-     Maternal HR            = {self.maternal_hr:.1f} BPM
-     HR separation          = {abs(hr_f - self.maternal_hr):.1f} BPM
+     Maternal HR            = {mat_hr_str}
+     HR separation          = {sep_str}
 
-  ✓ Morphological Consistency  [{mo_attr:.1f}% attribution]
-     QRS complex shape is consistent with fetal cardiac physiology.
-     Local morphological fidelity verified against EKF model.
+  [ok] {morph_line}
 
-  ✓ Temporal Independence      [{in_attr:.1f}% attribution]
+  [ok] Temporal Independence      [{in_attr:.1f}% attribution]
      This fetal beat is temporally separated from maternal QRS.
-     No maternal ECG overlap detected in ±{int(ECHO_MATERNAL_EXCLUSION_SEC*1000)} ms window.
+     No maternal ECG overlap detected in +-{int(ECHO_MATERNAL_EXCLUSION_SEC*1000)} ms window.
 
-  ─────────────────────────────────────────────────────────────
+  --------------------------------------------------------------
   PRIMARY SEPARATION CUE: {primary_cue}
 
   CLINICAL NOTE:
-  {'⚠ Fetal HR outside normal range. Recommend physician review.' if '⚠' in hr_flag else '✓ All parameters within expected fetal physiological bounds.'}
-╚══════════════════════════════════════════════════════════════╝
+  {'[WARN] Fetal HR outside normal range. Recommend physician review.' if hr_flag == 'WARN' else '[ok] All assessed parameters within expected fetal physiological bounds.'}
++--------------------------------------------------------------+
 """
         return report
 
-    # ── Visualization ───────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Visualization
+    # -------------------------------------------------------------------------
 
     def plot_attribution_heatmap(self,
                                  window_sec: float = 10.0,
-                                 start_sec: float = 0.0,
-                                 save_path: str = None,
-                                 dpi: int = 300) -> plt.Figure:
+                                 start_sec:  float = 0.0,
+                                 save_path:  str   = None,
+                                 dpi:        int   = 300) -> plt.Figure:
         """
-        ECHO attribution visualization — publication-quality figure.
+        ECHO attribution visualization -- publication-quality figure.
 
-        Three-panel plot:
-          1. Extracted fetal ECG with R-peak markers
-          2. Stacked attribution bar chart per beat
-          3. Instantaneous fetal HR with physiological bounds
-
-        Parameters
-        ----------
-        window_sec : duration to display
-        start_sec  : start time in seconds
-        save_path  : if provided, saves figure to this path
-        dpi        : figure DPI (300 for publication)
+        [FIX-2] Morphology panel is only shown when has_morphology=True.
+        For NIFECGDB, the stacked bar uses only HR contrast + independence.
         """
         attribution = self.compute_attributions()
         if not attribution:
-            print("[ECHO] No attributions computed — insufficient peaks.")
+            print("[ECHO] No attributions computed -- insufficient peaks.")
             return None
 
         fs        = self.fs
@@ -291,32 +341,29 @@ class ECHOExplainer:
         end_s     = min(start_s + int(window_sec * fs), len(self.fetal_signal))
         time_axis = np.arange(start_s, end_s) / fs
 
-        # Filter beats in window
-        beat_mask = (attribution["beat_times"] >= start_sec) & \
-                    (attribution["beat_times"] <= start_sec + window_sec)
+        beat_mask = ((attribution["beat_times"] >= start_sec) &
+                     (attribution["beat_times"] <= start_sec + window_sec))
 
-        beat_times  = attribution["beat_times"][beat_mask]
-        hr_attr     = attribution["hr_attribution"][beat_mask]
-        mo_attr     = attribution["morph_attribution"][beat_mask]
-        in_attr     = attribution["indep_attribution"][beat_mask]
-        hr_vals     = attribution["hr_values"][beat_mask]
-        conf        = attribution["confidence"][beat_mask]
+        beat_times = attribution["beat_times"][beat_mask]
+        hr_attr    = attribution["hr_attribution"][beat_mask]
+        mo_attr    = attribution["morph_attribution"][beat_mask]
+        in_attr    = attribution["indep_attribution"][beat_mask]
+        hr_vals    = attribution["hr_values"][beat_mask]
+        conf       = attribution["confidence"][beat_mask]
+        has_morph  = attribution.get("has_morphology", False)
 
-        # Colorblind-safe palette
-        col_hr    = "#2166AC"   # blue
-        col_morph = "#D6604D"   # red-orange
-        col_indep = "#4DAC26"   # green
+        col_hr    = "#2166AC"
+        col_morph = "#D6604D"
+        col_indep = "#4DAC26"
 
         fig, axes = plt.subplots(3, 1, figsize=(14, 9),
                                  gridspec_kw={"height_ratios": [3, 2, 2]})
         fig.patch.set_facecolor("white")
 
-        # ── Panel 1: Fetal ECG with beat markers ──────────────────────────
+        # Panel 1: Fetal ECG with beat markers
         ax1 = axes[0]
         ax1.plot(time_axis, self.fetal_signal[start_s:end_s],
                  color="black", lw=0.7, label="Extracted fetal ECG")
-
-        # Color-code beat markers by confidence
         cmap = plt.cm.RdYlGn
         for bt, cf in zip(beat_times, conf):
             peak_idx = int(bt * fs)
@@ -324,47 +371,55 @@ class ECHOExplainer:
                 ax1.axvline(bt, color=cmap(cf), alpha=0.4, lw=1.0)
                 ax1.scatter(bt, self.fetal_signal[peak_idx],
                             c=[cmap(cf)], s=40, zorder=5)
-
         ax1.set_ylabel("Amplitude (a.u.)", fontsize=10)
-        ax1.set_title("ECHO: Extracted Fetal ECG with Beat Confidence (color: low→high)",
+        ax1.set_title("ECHO: Extracted Fetal ECG with Beat Confidence (colour: low->high)",
                       fontsize=11, fontweight="bold")
         ax1.legend(fontsize=9, loc="upper right")
         ax1.grid(True, alpha=0.3)
         ax1.set_xlim(start_sec, start_sec + window_sec)
 
-        # ── Panel 2: Attribution stacked bar ──────────────────────────────
+        # Panel 2: Attribution stacked bar
         ax2 = axes[1]
         bar_w = min(0.08, (window_sec / (len(beat_times) + 1)) * 0.8)
 
         if len(beat_times) > 0:
-            ax2.bar(beat_times, hr_attr,   width=bar_w, color=col_hr,
+            ax2.bar(beat_times, hr_attr, width=bar_w, color=col_hr,
                     label="HR Contrast", alpha=0.9)
-            ax2.bar(beat_times, mo_attr,   width=bar_w, color=col_morph,
-                    bottom=hr_attr, label="Morphology", alpha=0.9)
-            ax2.bar(beat_times, in_attr,   width=bar_w, color=col_indep,
-                    bottom=hr_attr + mo_attr,
-                    label="Temporal Independence", alpha=0.9)
+            if has_morph and not np.all(np.isnan(mo_attr)):
+                mo_safe = np.where(np.isnan(mo_attr), 0.0, mo_attr)
+                ax2.bar(beat_times, mo_safe, width=bar_w, color=col_morph,
+                        bottom=hr_attr, label="Morphology", alpha=0.9)
+                ax2.bar(beat_times, in_attr, width=bar_w, color=col_indep,
+                        bottom=hr_attr + mo_safe,
+                        label="Temporal Independence", alpha=0.9)
+            else:
+                ax2.bar(beat_times, in_attr, width=bar_w, color=col_indep,
+                        bottom=hr_attr,
+                        label="Temporal Independence (no morph ref)", alpha=0.9)
 
         ax2.set_ylabel("Attribution", fontsize=10)
-        ax2.set_title("ECHO Attribution per Beat", fontsize=11, fontweight="bold")
+        title_suffix = "" if has_morph else " [Morphology N/A -- no direct electrode]"
+        ax2.set_title(f"ECHO Attribution per Beat{title_suffix}",
+                      fontsize=11, fontweight="bold")
         ax2.set_ylim(0, 1.05)
         ax2.legend(fontsize=9, loc="upper right", ncol=3)
         ax2.grid(True, alpha=0.3, axis='y')
         ax2.set_xlim(start_sec, start_sec + window_sec)
 
-        # ── Panel 3: Instantaneous fetal HR ──────────────────────────────
+        # Panel 3: Instantaneous fetal HR
         ax3 = axes[2]
         if len(beat_times) > 0 and len(hr_vals) > 0:
             ax3.plot(beat_times, hr_vals, "o-", color="purple",
                      markersize=5, lw=1.5, label="Fetal HR")
             ax3.fill_between(beat_times, hr_vals, alpha=0.1, color="purple")
 
-        ax3.axhline(110, color="red",  linestyle="--", lw=1.0, alpha=0.7,
-                    label="Fetal HR bounds [110–160 BPM]")
-        ax3.axhline(160, color="red",  linestyle="--", lw=1.0, alpha=0.7)
-        ax3.axhline(self.maternal_hr, color="blue", linestyle=":",
-                    lw=1.5, alpha=0.8,
-                    label=f"Maternal HR ({self.maternal_hr:.0f} BPM)")
+        ax3.axhline(FETAL_HR_MIN, color="red", linestyle="--", lw=1.0, alpha=0.7,
+                    label=f"Fetal HR bounds [{FETAL_HR_MIN}-160 BPM]")
+        ax3.axhline(160, color="red", linestyle="--", lw=1.0, alpha=0.7)
+        if not np.isnan(self.maternal_hr):
+            ax3.axhline(self.maternal_hr, color="blue", linestyle=":",
+                        lw=1.5, alpha=0.8,
+                        label=f"Maternal HR ({self.maternal_hr:.0f} BPM)")
 
         ax3.set_ylabel("HR (BPM)", fontsize=10)
         ax3.set_xlabel("Time (s)", fontsize=10)
@@ -385,39 +440,50 @@ class ECHOExplainer:
 
     def generate_summary_stats(self, attribution: dict) -> str:
         """
-        Generate recording-level summary statistics for the paper's results section.
+        Recording-level summary statistics.
+
+        [FIX-2] Clearly flags when morphology was not available.
         """
         if not attribution:
             return "No attribution data."
 
-        n = attribution["n_beats"]
-        hr = attribution["hr_values"]
-        conf = attribution["confidence"]
+        n        = attribution["n_beats"]
+        hr       = attribution["hr_values"]
+        conf     = attribution["confidence"]
+        has_morph = attribution.get("has_morphology", False)
 
-        # HR status counts
-        normal    = np.sum((hr >= 110) & (hr <= 160))
-        brady     = np.sum(hr < 110)
-        tachy     = np.sum(hr > 160)
+        normal = np.sum((hr >= FETAL_HR_MIN) & (hr <= 160))
+        brady  = np.sum(hr < FETAL_HR_MIN)
+        tachy  = np.sum(hr > 160)
+
+        morph_line = (
+            f"    Morphology               : {np.mean(attribution['morph_attribution'])*100:.1f}%"
+            if has_morph
+            else
+            "    Morphology               : N/A (no direct electrode reference)"
+        )
+
+        mat_hr_str = f"{self.maternal_hr:.1f} BPM" if not np.isnan(self.maternal_hr) else "N/A"
 
         summary = f"""
 ECHO Recording Summary
-────────────────────────────────────────
+----------------------------------------
   Total fetal beats analyzed : {n}
-  Mean fetal HR              : {np.mean(hr):.1f} ± {np.std(hr):.1f} BPM
-  Maternal HR                : {self.maternal_hr:.1f} BPM
+  Mean fetal HR              : {np.mean(hr):.1f} +/- {np.std(hr):.1f} BPM
+  Maternal HR                : {mat_hr_str}
   HR separation              : {abs(np.mean(hr) - self.maternal_hr):.1f} BPM
 
   Beat Classification:
-    Normal HR (110–160 BPM)  : {normal} ({100*normal/n:.1f}%)
-    Bradycardia (<110 BPM)   : {brady}  ({100*brady/n:.1f}%)
+    Normal HR ({FETAL_HR_MIN}-160 BPM)  : {normal} ({100*normal/n:.1f}%)
+    Bradycardia (<{FETAL_HR_MIN} BPM)   : {brady}  ({100*brady/n:.1f}%)
     Tachycardia (>160 BPM)   : {tachy}  ({100*tachy/n:.1f}%)
 
   Mean attribution breakdown:
     HR Contrast              : {np.mean(attribution['hr_attribution'])*100:.1f}%
-    Morphology               : {np.mean(attribution['morph_attribution'])*100:.1f}%
+{morph_line}
     Temporal Independence    : {np.mean(attribution['indep_attribution'])*100:.1f}%
 
-  Mean confidence score      : {np.mean(conf)*100:.1f}%
-────────────────────────────────────────
+  Mean confidence score      : {np.nanmean(conf)*100:.1f}%
+----------------------------------------
 """
         return summary
