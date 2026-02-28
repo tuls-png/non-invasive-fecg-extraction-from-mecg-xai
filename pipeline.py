@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import FS, ICA_N_COMPONENTS, MATERNAL_ICA2_CORR_THRESH, FETAL_HR_MIN
+from config_loader import get_config
 from preprocessing.filters import preprocess_multichannel, preprocess_channel
 from preprocessing.qrs_detector import (
     detect_maternal_qrs, detect_fetal_qrs,
@@ -40,19 +40,13 @@ from evaluation.metrics import evaluate
 from xai.echo import ECHOExplainer
 
 
-# -- Tunable constants -------------------------------------------------------
-FETAL_HR_LOW    = 100   # was 110 — align with FETAL_HR_MIN, stop rejecting 100-110 BPM
-FETAL_HR_HIGH   = 185   # unchanged
-FETAL_HR_CENTRE = 130   # was 147 — matches actual ADFECGDB fetal HR distribution
-HR_SEP_MIN_BPM  = 15    # was 20 — reduces false rejections when maternal HR is elevated
-PATH_A_PREFERENCE = 1.5
-# ---------------------------------------------------------------------------
-
-
-def _min_usable_peaks(duration_sec: float) -> int:
-    """[FIX-2] Adaptive minimum peak count from recording length."""
-    expected = duration_sec * FETAL_HR_LOW / 60.0
-    return max(30, int(expected * 0.5))
+def _min_usable_peaks(duration_sec: float, cfg, dataset: str = "ADFECGDB") -> int:
+    if dataset == "NIFECGDB":
+        expected = duration_sec * cfg.FETAL_HR_MIN / 60.0
+        return max(20, int(expected * 0.15))
+    else:
+        expected = duration_sec * cfg.FETAL_HR_LOW / 60.0
+        return max(30, int(expected * 0.5))
 
 
 def _norm(sig):
@@ -67,7 +61,7 @@ def _candidate_hr(sig, fs):
     return peaks, mean_hr
 
 
-def _is_fetal_hr(mean_hr: float, maternal_hr: float) -> bool:
+def _is_fetal_hr(mean_hr: float, maternal_hr: float, cfg) -> bool:
     """
     Check if a candidate HR is in the fetal range and sufficiently
     separated from maternal HR.
@@ -79,33 +73,29 @@ def _is_fetal_hr(mean_hr: float, maternal_hr: float) -> bool:
     """
     if np.isnan(mean_hr):
         return False
-
-    in_range = FETAL_HR_LOW <= mean_hr <= FETAL_HR_HIGH
-
-    # Relax separation requirement when maternal HR is elevated
+    in_range = cfg.FETAL_HR_LOW <= mean_hr <= cfg.FETAL_HR_HIGH
     if not np.isnan(maternal_hr) and maternal_hr > 85:
-        sep_threshold = HR_SEP_MIN_BPM * 0.7
+        sep_threshold = cfg.HR_SEP_MIN_BPM * 0.7
     else:
-        sep_threshold = HR_SEP_MIN_BPM
-
+        sep_threshold = cfg.HR_SEP_MIN_BPM
     sep_ok = abs(mean_hr - maternal_hr) >= sep_threshold
-
     return in_range and sep_ok
 
 
-def _hr_score(mean_hr, expected_hr=FETAL_HR_CENTRE):
+def _hr_score(mean_hr, cfg, expected_hr=None):
+    centre = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
     if np.isnan(mean_hr):
         return 0.0
-    return 1.0 / (1.0 + abs(mean_hr - expected_hr) / 30.0)
+    return 1.0 / (1.0 + abs(mean_hr - centre) / 30.0)
 
 
-def _find_maternal_residual_idx(ICs, maternal_ic):
+def _find_maternal_residual_idx(ICs, maternal_ic, cfg):
     """
     [FIX-1] Find ICA2 component most correlated with maternal IC.
     Returns the index to exclude, or -1 if none exceed threshold.
     """
     best_idx  = -1
-    best_corr = MATERNAL_ICA2_CORR_THRESH
+    best_corr = cfg.MATERNAL_ICA2_CORR_THRESH
     for i, ic in enumerate(ICs):
         if np.var(ic) < 1e-10:
             continue
@@ -119,16 +109,14 @@ def _find_maternal_residual_idx(ICs, maternal_ic):
     if best_idx >= 0:
         print(f"[PHASE] Path B: excluding IC{best_idx+1} "
               f"(|corr| with maternal IC = {best_corr:.3f} "
-              f"> threshold {MATERNAL_ICA2_CORR_THRESH})")
+              f"> threshold {cfg.MATERNAL_ICA2_CORR_THRESH})")
     return best_idx
 
 
-def _best_ic(ICs, exclude_idx, maternal_hr, fs,
+def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
              label="", expected_hr=None, min_peaks=100):
-    """Select best fetal IC. [FIX-2] min_peaks now adaptive."""
-    centre     = expected_hr if expected_hr is not None else FETAL_HR_CENTRE
+    centre     = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
     candidates = []
-
     for i, ic in enumerate(ICs):
         if i == exclude_idx:
             continue
@@ -139,8 +127,8 @@ def _best_ic(ICs, exclude_idx, maternal_hr, fs,
         sig_norm       = _norm(ic)
         peaks, mean_hr = _candidate_hr(sig_norm, fs)
         n_peaks        = len(peaks)
-        passes_hr      = _is_fetal_hr(mean_hr, maternal_hr)
-        hr_sc          = _hr_score(mean_hr, centre)
+        passes_hr      = _is_fetal_hr(mean_hr, maternal_hr, cfg)
+        hr_sc          = _hr_score(mean_hr, cfg, expected_hr)
         candidates.append({
             "idx": i, "sig": sig_norm, "peaks": peaks,
             "n_peaks": n_peaks, "mean_hr": mean_hr,
@@ -197,10 +185,10 @@ def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts):
     return out
 
 class PHASEPipeline:
-    """Full PHASE pipeline with HR-aware dual-path fetal IC selection."""
-
-    def __init__(self, fs=FS, use_rts=True, ekf_bypass=False, verbose=True):
-        self.fs         = fs
+    def __init__(self, fs=None, use_rts=True, ekf_bypass=False, verbose=True,
+                 dataset=None):
+        self.cfg        = get_config(dataset)
+        self.fs         = fs if fs is not None else self.cfg.FS
         self.use_rts    = use_rts
         self.ekf_bypass = ekf_bypass
         self.verbose    = verbose
@@ -210,12 +198,14 @@ class PHASEPipeline:
             print(f"[PHASE] {msg}")
 
     def run(self, recording, save_figures=False, figures_dir="figures"):
+        cfg      = self.cfg 
+        dataset  = recording.get("dataset", "ADFECGDB")
         rec_id   = recording["recording"]
         abd      = recording["abdomen"]
         direct   = recording.get("direct")
         fs       = recording["fs"]
         duration = recording.get("duration_sec", abd.shape[1] / fs)
-        min_peaks = _min_usable_peaks(duration)   # [FIX-2]
+        min_peaks = _min_usable_peaks(duration, cfg, dataset)
 
         self._log("=" * 55)
         self._log(f"Processing: {rec_id}  [{recording.get('dataset','?')}]")
@@ -229,7 +219,7 @@ class PHASEPipeline:
 
         # Step 2: ICA1
         self._log("Step 2: ICA1...")
-        ICs1, _            = run_ica(abd_proc, n_components=ICA_N_COMPONENTS)
+        ICs1, _            = run_ica(abd_proc, n_components=cfg.ICA_N_COMPONENTS)
         maternal_ic_idx, _ = select_maternal_ic(ICs1, fs)
         maternal_ic        = get_ic_as_signal(ICs1, maternal_ic_idx)
 
@@ -241,23 +231,24 @@ class PHASEPipeline:
         self._log(f"  {len(maternal_peaks)} maternal peaks, HR = {maternal_hr:.1f} BPM")
 
         ann_path     = recording.get("annotation_path")
-        print("ANNPATH", ann_path)
         expected_fhr = None
-        if ann_path:
+        if ann_path and dataset == "ADFECGDB":
             ann_peaks = load_adfecgdb_annotation(ann_path)
             if len(ann_peaks) >= 5:
                 ann_stats    = compute_hr_stats(ann_peaks, fs)
                 expected_fhr = ann_stats["mean_hr"]
                 self._log(f"  Annotation prior: {len(ann_peaks)} peaks, "
-                          f"expected fetal HR = {expected_fhr:.1f} BPM")
+                        f"expected fetal HR = {expected_fhr:.1f} BPM")
+        elif ann_path and dataset == "NIFECGDB":
+            self._log("  Annotation skipped (NIFECGDB .qrs = maternal beats)")
 
         # Step 4: Path A
         self._log("Step 4: Path A -- ICA1 direct (HR-aware scan)...")
         a_sig, a_idx, a_peaks, a_hr = _best_ic(
-            ICs1, maternal_ic_idx, maternal_hr, fs,
+            ICs1, maternal_ic_idx, maternal_hr, fs, cfg,
             label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks)
         a_n     = len(a_peaks)
-        a_valid = _is_fetal_hr(a_hr, maternal_hr)
+        a_valid = _is_fetal_hr(a_hr, maternal_hr, cfg)
         self._log(f"  Path A: IC{a_idx+1}, {a_n} peaks, "
                   f"HR={a_hr:.1f} BPM, valid={'YES' if a_valid else 'NO'}")
 
@@ -281,20 +272,20 @@ class PHASEPipeline:
 
         # Step 8: Path B -- ICA2 with [FIX-1] maternal residual exclusion
         self._log("Step 8: Path B -- ICA2 on residual (HR-aware scan)...")
-        ICs2, _          = run_ica(residual, n_components=ICA_N_COMPONENTS)
-        mat_residual_idx = _find_maternal_residual_idx(ICs2, maternal_ic)   # [FIX-1]
+        ICs2, _          = run_ica(residual, n_components=cfg.ICA_N_COMPONENTS)
+        mat_residual_idx = _find_maternal_residual_idx(ICs2, maternal_ic, cfg)
         b_sig, b_idx, b_peaks, b_hr = _best_ic(
-            ICs2, mat_residual_idx, maternal_hr, fs,
+            ICs2, mat_residual_idx, maternal_hr, fs, cfg,
             label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks)
         b_n     = len(b_peaks)
-        b_valid = _is_fetal_hr(b_hr, maternal_hr)
+        b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
         self._log(f"  Path B: IC{b_idx+1}, {b_n} peaks, "
                   f"HR={b_hr:.1f} BPM, valid={'YES' if b_valid else 'NO'}")
 
         # Step 9: Select best path
         self._log("Step 9: Selecting best path...")
         if a_valid and b_valid:
-            if a_n >= b_n * PATH_A_PREFERENCE:
+            if a_n >= b_n * cfg.PATH_A_PREFERENCE:
                 chosen_sig, chosen_peaks = a_sig, a_peaks
                 chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
             else:
@@ -336,7 +327,7 @@ class PHASEPipeline:
 
         # Step 12: Evaluation
         self._log("Step 12: Evaluation...")
-        if ann_path:
+        if ann_path and dataset == "ADFECGDB":
             ref_peaks = load_adfecgdb_annotation(ann_path)
             self._log(f"  Reference: .qrs annotation -- {len(ref_peaks)} peaks")
         elif dir_proc is not None:
@@ -344,9 +335,12 @@ class PHASEPipeline:
             self._log(f"  Reference: Direct_1 detector -- {len(ref_peaks)} peaks")
         else:
             ref_peaks = np.array([])
-            self._log("  Reference: none available")
-        metrics = evaluate(fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
-                           label=f"PHASE ({rec_id})")
+            self._log("  Reference: none available (NIFECGDB)")
+        metrics = evaluate(
+                fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
+                label=f"PHASE ({rec_id})",
+                tolerance_ms=cfg.EVAL_TOLERANCE_MS   # pass from config
+            )
 
         # Step 13: ECHO XAI -- [FIX-3] explicit has_reference flag
         self._log("Step 13: ECHO XAI...")

@@ -38,7 +38,13 @@ from config import (
     PT_INTEGRATION_WINDOW_SEC, PT_THRESHOLD_FACTOR,
     FETAL_HR_MIN, FETAL_HR_MAX,
 )
-
+from config_nifecgdb import (
+    FS,
+    PT_MATERNAL_BANDPASS_LOW, PT_MATERNAL_BANDPASS_HIGH, PT_MATERNAL_BANDPASS_ORDER,
+    PT_FETAL_BANDPASS_LOW,    PT_FETAL_BANDPASS_HIGH,    PT_FETAL_BANDPASS_ORDER,
+    PT_INTEGRATION_WINDOW_SEC, PT_THRESHOLD_FACTOR,
+    FETAL_HR_MIN, FETAL_HR_MAX,
+)
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -371,7 +377,11 @@ def compute_hr_from_samples(peaks, fs):
 
 
 
- 
+def load_adfecgdb_annotation(ann_path: str):
+    file_path = ann_path[:-4]
+    ann = wfdb.rdann(file_path, 'qrs')
+    peaks = ann.sample
+    return peaks
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def compute_hr_stats(peaks: np.ndarray, fs: int = FS) -> dict:

@@ -29,6 +29,15 @@ from config import (
     PT_FETAL_BANDPASS_LOW,    PT_FETAL_BANDPASS_HIGH,
     PT_INTEGRATION_WINDOW_SEC, PT_THRESHOLD_FACTOR,
 )
+from config_nifecgdb import (
+    ICA_N_COMPONENTS, ICA_MAX_ITER, ICA_RANDOM_STATE, ICA_TOL,
+    MATERNAL_HR_MIN, MATERNAL_HR_MAX, FETAL_HR_MIN, FETAL_HR_MAX,
+    ECHO_MATERNAL_EXCLUSION_SEC, FS,
+    PT_MATERNAL_BANDPASS_LOW, PT_MATERNAL_BANDPASS_HIGH,
+    PT_FETAL_BANDPASS_LOW,    PT_FETAL_BANDPASS_HIGH,
+    PT_INTEGRATION_WINDOW_SEC, PT_THRESHOLD_FACTOR,
+)
+
 from scipy.signal import butter, filtfilt, find_peaks
 from preprocessing.qrs_detector import pan_tompkins, compute_hr_stats
 

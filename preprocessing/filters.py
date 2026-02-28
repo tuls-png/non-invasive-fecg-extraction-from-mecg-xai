@@ -23,6 +23,10 @@ from config import (
     FS, BANDPASS_LOW, BANDPASS_HIGH, BANDPASS_ORDER,
     NOTCH_FREQ, NOTCH_QUALITY, MEDFILT_KERNEL
 )
+from config_nifecgdb import (
+    FS, BANDPASS_LOW, BANDPASS_HIGH, BANDPASS_ORDER,
+    NOTCH_FREQ, NOTCH_QUALITY, MEDFILT_KERNEL
+)
 
 
 def bandpass_filter(signal: np.ndarray, fs: int = FS,

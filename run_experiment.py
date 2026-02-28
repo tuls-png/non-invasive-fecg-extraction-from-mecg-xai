@@ -45,7 +45,7 @@ def run_full(data_dir: str, save_figures: bool = True):
     print("="*60 + "\n")
 
     recordings  = load_all_recordings(data_dir)
-    pipe        = PHASEPipeline(verbose=True)
+    pipe = PHASEPipeline(verbose=True, dataset="ADFECGDB")
     logger      = ResultsLogger("results")
     all_metrics = []
 
@@ -150,7 +150,7 @@ def run_nifecgdb(nifecgdb_dir: str, save_figures: bool = False,
     print("="*60 + "\n")
 
     recordings  = load_all_nifecgdb(nifecgdb_dir, max_recordings=max_recordings)
-    pipe        = PHASEPipeline(verbose=True)
+    pipe = PHASEPipeline(verbose=True, dataset="NIFECGDB")
     logger      = ResultsLogger("results_nifecgdb")
     all_metrics = []
     skipped     = 0
@@ -167,13 +167,15 @@ def run_nifecgdb(nifecgdb_dir: str, save_figures: bool = False,
             result = pipe.run(
                 rec,
                 save_figures=save_figures,
-                figures_dir=f"figures_nifecgdb"
+                figures_dir="figures_nifecgdb"
             )
             logger.log_recording(rec["recording"], "PHASE_nifecgdb",
-                                 result["metrics"])
+                                result["metrics"])
             all_metrics.append(result["metrics"])
         except Exception as e:
+            import traceback
             print(f"[ERROR] {rec['recording']}: {e}")
+            traceback.print_exc()   # ← shows exact line
             skipped += 1
             continue
 
@@ -182,7 +184,10 @@ def run_nifecgdb(nifecgdb_dir: str, save_figures: bool = False,
     print("\n" + "="*60)
     print("  NIFECGDB AGGREGATE RESULTS")
     print("="*60)
-    aggregate_results(all_metrics)
+    if all_metrics:
+        aggregate_results(all_metrics)
+    else:
+        print("[Summary] No successful recordings to aggregate.")
     logger.save()
     logger.print_ablation_table()
     return all_metrics

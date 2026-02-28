@@ -23,12 +23,12 @@ cleanly rather than silently polluting results tables.
 
 import numpy as np
 from scipy.stats import pearsonr, wilcoxon
-from config import FS, EVAL_TOLERANCE_MS
-
+_DEFAULT_FS = 1000
+_DEFAULT_TOLERANCE_MS = 50
 
 def match_peaks(detected: np.ndarray, reference: np.ndarray,
-                fs: int = FS,
-                tolerance_ms: float = EVAL_TOLERANCE_MS) -> dict:
+                fs: int = _DEFAULT_FS,
+                tolerance_ms: float = _DEFAULT_TOLERANCE_MS) -> dict:
     """
     Match detected peaks to reference peaks within a tolerance window.
 
@@ -129,7 +129,7 @@ def compute_cc(estimated: np.ndarray, reference: np.ndarray) -> float:
 
 def compute_fhr_mae(detected_peaks: np.ndarray,
                     reference_peaks: np.ndarray,
-                    fs: int = FS) -> float:
+                    fs: int = _DEFAULT_FS) -> float:
     """
     Mean absolute error of fetal heart rate estimate (BPM).
 
@@ -174,8 +174,9 @@ def evaluate(estimated_signal: np.ndarray,
              reference_signal: np.ndarray | None,
              estimated_peaks: np.ndarray,
              reference_peaks: np.ndarray,
-             fs: int = FS,
-             label: str = "PHASE") -> dict:
+             fs: int = _DEFAULT_FS,
+             label: str = "PHASE",
+             tolerance_ms =_DEFAULT_TOLERANCE_MS) -> dict:
     """
     Run full evaluation suite.
 

@@ -41,15 +41,28 @@ class ResultsLogger:
         method       : e.g. "PHASE_full", "Baseline_ICA_WSVD"
         metrics      : output of evaluation.metrics.evaluate()
         """
+        def _safe_value(v):
+            """Convert metric value to a JSON/CSV-safe scalar."""
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                if np.isnan(f) or np.isinf(f):
+                    return None
+                return round(f, 4)
+            except (TypeError, ValueError):
+                return str(v)
+
         row = {
-            "timestamp"   : self.timestamp,
-            "recording"   : recording_id,
-            "method"      : method,
-            **{k: (round(float(v), 4) if isinstance(v, (int, float, np.floating))
-                   and not np.isnan(float(v)) else v)
-               for k, v in metrics.items()
-               if k not in ("label", "tp_pairs")},
+            "timestamp" : self.timestamp,
+            "recording" : recording_id,
+            "method"    : method,
         }
+        for k, v in metrics.items():
+            if k in ("label", "tp_pairs"):
+                continue
+            row[k] = _safe_value(v)
+
         self.records.append(row)
         print(f"[Logger] Logged: {recording_id} / {method}")
 

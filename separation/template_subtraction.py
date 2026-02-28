@@ -34,6 +34,7 @@ that justifies its inclusion as a novel contribution.
 import numpy as np
 from scipy.signal import butter, filtfilt
 from config import FS
+from config_nifecgdb import FS
 
 
 def extract_maternal_template(abd_signals: np.ndarray,

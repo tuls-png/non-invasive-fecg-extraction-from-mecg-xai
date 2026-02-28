@@ -20,6 +20,12 @@ from config import (
     EKF_OBSERVE_NOISE, EKF_STATE_COV_INIT, EKF_PQRST_PARAMS,
     FETAL_HR_MIN, FETAL_HR_MAX,
 )
+from config_nifecgdb import (
+    FS, EKF_FETAL_HR_INIT, EKF_PROCESS_NOISE,
+    EKF_OBSERVE_NOISE, EKF_STATE_COV_INIT, EKF_PQRST_PARAMS,
+    FETAL_HR_MIN, FETAL_HR_MAX,
+)
+
 
 
 class FetalECGKalmanFilter:

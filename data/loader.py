@@ -22,6 +22,11 @@ from config import (
     NIFECGDB_ABDOMINAL_PREFIX, NIFECGDB_THORACIC_PREFIX,
     NIFECGDB_MAX_ABD_CHANNELS, FS
 )
+from config_nifecgdb import (
+    ADFECGDB_ABDOMEN_CHANNELS, ADFECGDB_DIRECT_CHANNEL,
+    NIFECGDB_ABDOMINAL_PREFIX, NIFECGDB_THORACIC_PREFIX,
+    NIFECGDB_MAX_ABD_CHANNELS, FS
+)
 
 
 # ── ADFECGDB ──────────────────────────────────────────────────────────────────

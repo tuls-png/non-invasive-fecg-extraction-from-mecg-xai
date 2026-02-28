@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
 from config import FS, FETAL_HR_MIN, FETAL_HR_MAX, ECHO_MATERNAL_EXCLUSION_SEC
-
+from config_nifecgdb import FS, FETAL_HR_MIN, FETAL_HR_MAX, ECHO_MATERNAL_EXCLUSION_SEC
 
 class ECHOExplainer:
     """

@@ -26,12 +26,12 @@ NOTCH_QUALITY  = 30.0
 MEDFILT_KERNEL = 3
 
 # -- Physiological Constraints -----------------------------------------------
-MATERNAL_HR_MIN = 55
-MATERNAL_HR_MAX = 110
+MATERNAL_HR_MIN = 50
+MATERNAL_HR_MAX = 115
 
 # [FIX-3] FETAL_HR_MAX aligned with pipeline constant (185)
 FETAL_HR_MIN = 100
-FETAL_HR_MAX = 185
+FETAL_HR_MAX = 200
 
 QRS_SIGMA_SEC       = 0.04
 QRS_BASELINE_WEIGHT = 0.05
@@ -71,7 +71,7 @@ PT_INTEGRATION_WINDOW_SEC = 0.08
 PT_THRESHOLD_FACTOR = 1.0
 
 # -- EKF ---------------------------------------------------------------------
-EKF_FETAL_HR_INIT  = 140
+EKF_FETAL_HR_INIT  = 150
 # [FIX-4] Raised from [0.01, 0.01, 0.1]. Low process noise made EKF over-trust
 # its oscillator model and smooth away real fetal beats.
 EKF_PROCESS_NOISE  = [0.1, 0.1, 1.0]
@@ -112,8 +112,8 @@ RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
 # ----------------------------------------------------------------------------
-FETAL_HR_LOW    = 100   
-FETAL_HR_HIGH   = 185   
-FETAL_HR_CENTRE = 130   
-HR_SEP_MIN_BPM  = 15    
+FETAL_HR_LOW      = 100
+FETAL_HR_HIGH     = 200
+FETAL_HR_CENTRE   = 140
+HR_SEP_MIN_BPM    = 15
 PATH_A_PREFERENCE = 1.5

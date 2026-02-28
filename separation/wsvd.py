@@ -14,7 +14,12 @@ from config import (
     WSVD_COMPONENT_CORR_THRESH, WSVD_MAX_ENERGY_REMOVAL,
     WSVD_CHANNEL_R2_MIN
 )
-
+from config_nifecgdb import (
+    FS, QRS_SIGMA_SEC, QRS_BASELINE_WEIGHT,
+    WSVD_WINDOW_SEC, WSVD_OVERLAP, WSVD_N_COMPONENTS,
+    WSVD_COMPONENT_CORR_THRESH, WSVD_MAX_ENERGY_REMOVAL,
+    WSVD_CHANNEL_R2_MIN
+)
 
 def gaussian_weight_matrix(n_samples: int, qrs_peaks: np.ndarray,
                             fs: int = FS,
