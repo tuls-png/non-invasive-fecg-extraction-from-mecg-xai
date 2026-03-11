@@ -103,55 +103,68 @@ def plot_maternal_cancellation(abdomen: np.ndarray,
 
 
 def plot_fetal_comparison(fetal_estimated: np.ndarray,
-                           fetal_reference: np.ndarray,
+                           fetal_reference: np.ndarray | None,
                            peaks_est: np.ndarray,
-                           peaks_ref: np.ndarray,
+                           peaks_ref: np.ndarray | None,
                            fs: int,
                            start_sec: float = 0,
                            duration_sec: float = 10,
                            save_path: str = None) -> plt.Figure:
-    """Figure 3: Estimated vs reference fetal ECG with QRS markers."""
+    """Figure 3: Estimated fetal ECG with QRS markers. Reference overlay shown if available."""
     _apply_style()
     s = int(start_sec * fs)
     e = s + int(duration_sec * fs)
     t = np.arange(s, e) / fs
 
-    cc = np.corrcoef(fetal_estimated, fetal_reference)[0, 1]
-    sign = -1.0 if cc < 0 else 1.0
-    fetal_est_plot = sign * fetal_estimated
+    has_reference = (fetal_reference is not None and 
+                     hasattr(fetal_reference, '__len__') and 
+                     len(fetal_reference) >= e)
 
     def norm(x):
-        r = np.max(x) - np.min(x)
+        r = np.max(x) - np.min(x)                       
         return (x - np.min(x)) / (r + 1e-12)
 
+    if has_reference:
+        cc = np.corrcoef(fetal_estimated, fetal_reference)[0, 1]
+        sign = -1.0 if cc < 0 else 1.0
+    else:
+        sign = 1.0
+
+    fetal_est_plot = sign * fetal_estimated
     est_n = norm(fetal_est_plot[s:e])
-    ref_n = norm(fetal_reference[s:e])
-
+    
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(t, ref_n, color=COLORS["fetal_ref"], lw=1.0,
-            label="Direct fetal ECG (reference)", alpha=0.85)
-    ax.plot(t, est_n, color=COLORS["fetal_est"], lw=0.8,
-            label="PHASE extracted fetal ECG", alpha=0.85, linestyle="--")
 
-    # --- robust integer-safe indexing ---
-    ref_in = np.asarray([p for p in peaks_ref if s <= p < e], dtype=np.int64)
+    if has_reference:
+        ref_n = norm(fetal_reference[s:e])
+        ax.plot(t, ref_n, color=COLORS["fetal_ref"], lw=1.0,
+                label="Direct fetal ECG (reference)", alpha=0.85)
+
+    ax.plot(t, est_n, color=COLORS["fetal_est"], lw=0.8,    
+            label="PHASE extracted fetal ECG", alpha=0.85,
+            linestyle="--" if has_reference else "-")
+    '''
+    ax.plot(t, est_n, color )
+    '''
+
+    if has_reference and peaks_ref is not None:
+        ref_in = np.asarray([p for p in peaks_ref if s <= p < e], dtype=np.int64)
+        if ref_in.size > 0:
+            idx_ref = ref_in - s
+            valid = (idx_ref >= 0) & (idx_ref < len(ref_n))
+            # ax.scatter(ref_in[valid] / fs,
+            #         ref_n[idx_ref[valid]],
+            #         color=COLORS["peaks_ref"], marker="o", s=30, zorder=5,
+            #         label="Reference QRS peaks")
+
     est_in = np.asarray([p for p in peaks_est if s <= p < e], dtype=np.int64)
-
-    if ref_in.size > 0:
-        idx_ref = ref_in - s
-        valid = (idx_ref >= 0) & (idx_ref < len(ref_n))
-        ax.scatter(ref_in[valid] / fs,
-                ref_n[idx_ref[valid]],
-                color=COLORS["peaks_ref"], marker="o", s=30, zorder=5,
-                label="Reference QRS peaks")
-
     if est_in.size > 0:
         idx_est = est_in - s
         valid = (idx_est >= 0) & (idx_est < len(est_n))
-        ax.scatter(est_in[valid] / fs,
-                est_n[idx_est[valid]],
-                color=COLORS["peaks_est"], marker="x", s=40, zorder=5,
-                label="Detected QRS peaks")
+        # ax.scatter(est_in[valid] / fs,
+        #         est_n[idx_est[valid]],
+        #         color=COLORS["peaks_est"], marker="x", s=40, zorder=5,
+        #         label="Detected QRS peaks")
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Normalized amplitude")
@@ -162,7 +175,6 @@ def plot_fetal_comparison(fetal_estimated: np.ndarray,
     if save_path:
         fig.savefig(save_path, dpi=FIG_DPI, bbox_inches="tight", facecolor="white")
     return fig
-
 
 def plot_ablation_results(ablation_data: dict,
                            metric: str = "F1",
@@ -257,12 +269,12 @@ def plot_sota_comparison(methods: dict,
 
 def plot_ekf_refinement(before_ekf: np.ndarray,
                          after_ekf: np.ndarray,
-                         reference: np.ndarray,
+                         reference: np.ndarray | None,
                          fs: int,
                          start_sec: float = 0,
                          duration_sec: float = 5,
                          save_path: str = None) -> plt.Figure:
-    """Figure 6: Effect of EKF refinement on morphological detail."""
+    """Figure 6: Effect of EKF refinement. Reference panel shown only if available."""
     _apply_style()
     s = int(start_sec * fs)
     e = s + int(duration_sec * fs)
@@ -272,17 +284,35 @@ def plot_ekf_refinement(before_ekf: np.ndarray,
         r = np.max(x) - np.min(x)
         return (x - np.min(x)) / (r + 1e-12)
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 7), sharex=True)
-    axes[0].plot(t, norm(reference[s:e]),   color=COLORS["fetal_ref"], lw=0.9)
-    axes[0].set_ylabel("Amplitude")
-    axes[0].set_title("(a) Reference direct fetal ECG")
-    axes[1].plot(t, norm(before_ekf[s:e]),  color=COLORS["fetal_est"], lw=0.9)
-    axes[1].set_ylabel("Amplitude")
-    axes[1].set_title("(b) Fetal ECG estimate before EKF refinement (ICA output)")
-    axes[2].plot(t, norm(after_ekf[s:e]),   color=COLORS["maternal"],  lw=0.9)
-    axes[2].set_ylabel("Amplitude")
-    axes[2].set_xlabel("Time (s)")
-    axes[2].set_title("(c) Fetal ECG after EKF-RTS refinement (improved morphology)")
+    has_reference = (reference is not None and
+                     hasattr(reference, '__len__') and
+                     len(reference) >= e)
+
+    n_rows = 3 if has_reference else 2
+    fig, axes = plt.subplots(n_rows, 1, figsize=(12, 4 + 2 * n_rows), sharex=True)
+
+    if has_reference:
+        axes[0].plot(t, norm(reference[s:e]), color=COLORS["fetal_ref"], lw=0.9)
+        axes[0].set_ylabel("Amplitude")
+        axes[0].set_title("(a) Reference direct fetal ECG")
+        pre_ax  = axes[1]
+        post_ax = axes[2]
+        pre_label  = "(b) Fetal ECG estimate before EKF refinement (ICA output)"
+        post_label = "(c) Fetal ECG after EKF-RTS refinement (improved morphology)"
+    else:
+        pre_ax  = axes[0]
+        post_ax = axes[1]
+        pre_label  = "(a) Fetal ECG estimate before EKF refinement (ICA output)"
+        post_label = "(b) Fetal ECG after EKF-RTS refinement (improved morphology)"
+
+    pre_ax.plot(t, norm(before_ekf[s:e]), color=COLORS["fetal_est"], lw=0.9)
+    pre_ax.set_ylabel("Amplitude")
+    pre_ax.set_title(pre_label)
+
+    post_ax.plot(t, norm(after_ekf[s:e]), color=COLORS["maternal"], lw=0.9)
+    post_ax.set_ylabel("Amplitude")
+    post_ax.set_xlabel("Time (s)")
+    post_ax.set_title(post_label)
 
     plt.tight_layout()
     if save_path:

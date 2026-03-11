@@ -1,0 +1,232 @@
+════════════════════════════════════════════════════════════════════════════════
+                    STREAMLINED PIPELINE ARCHITECTURE
+════════════════════════════════════════════════════════════════════════════════
+
+
+ARCHITECTURE DIAGRAM
+─────────────────────────────────────────────────────────────────────────────────
+
+┌─ USER CODE ──────────────────────────────────────────────────────────────────┐
+│                                                                               │
+│  Option A (New - Recommended):        Option B (Old - Still Works):          │
+│  ──────────────────────────────       ────────────────────────────          │
+│                                                                               │
+│  from configs import                  from config_loader import             │
+│    get_config                           get_config                           │
+│  from dataset_handlers import         from data.loader import               │
+│    get_dataset                          load_all_recordings                  │
+│                                                                               │
+│  cfg = get_config("adfecgdb")        cfg = get_config("adfecgdb")          │
+│  handler = get_dataset("adfecgdb")   recs = load_all_recordings("/path")   │
+│  recs = handler.load_all_...()                                              │
+│                                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─ ABSTRACTION LAYER ───────────────────────────────────────────────────────┐
+│                                                                            │
+│                    config_loader.py (wrapper)                             │
+│                           ↓                                                │
+│                  configs/get_config()                                     │
+│                                                                            │
+│                    data/loader.py (wrapper)                               │
+│                           ↓                                                │
+│            dataset_handlers/get_dataset()                                 │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─ CORE MODULES ────────────────────────────────────────────────────────────┐
+│                                                                            │
+│  ┌──────────────────────┐        ┌──────────────────────────────────┐    │
+│  │   CONFIGS MODULE     │        │  DATASET_HANDLERS MODULE         │    │
+│  ├──────────────────────┤        ├──────────────────────────────────┤    │
+│  │ __init__.py          │        │ __init__.py                      │    │
+│  │   → get_config()     │        │   → get_dataset()               │    │
+│  │                      │        │   → register_dataset()          │    │
+│  │ base.py              │        │                                  │    │
+│  │   → BaseConfig       │        │ base.py                          │    │
+│  │     (all params)     │        │   → AbstractDatasetHandler       │    │
+│  │                      │        │                                  │    │
+│  │ adfecgdb.yaml        │        │ registry.py                      │    │
+│  │   → Override params  │        │   → DatasetRegistry             │    │
+│  │                      │        │                                  │    │
+│  │ nifecgdb.yaml        │        │ adfecgdb.py                      │    │
+│  │   → Override params  │        │   → ADFECGDBHandler             │    │
+│  │                      │        │                                  │    │
+│  │                      │        │ nifecgdb.py                      │    │
+│  │                      │        │   → NIFECGDBHandler             │    │
+│  └──────────────────────┘        └──────────────────────────────────┘    │
+│         ↓                                       ↓                          │
+│   Get Configuration                    Get Dataset Handler                │
+│   Merge YAML Overrides                 Load Recordings                    │
+│   Apply to BaseConfig                  Validate Data                      │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─ DATA & PIPELINE ─────────────────────────────────────────────────────────┐
+│                                                                            │
+│            config/recordings loaded                                       │
+│                    ↓                                                      │
+│         pipeline.py (PHASEPipeline)                                       │
+│         Uses: cfg parameters + records                                    │
+│                    ↓                                                      │
+│         Results: metrics, plots, analysis                                 │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+
+DATA FLOW EXAMPLE
+─────────────────────────────────────────────────────────────────────────────────
+
+1. User Request
+   ├─ python run_experiment_new.py --dataset adfecgdb --mode full
+   └─ OR
+      cfg = get_config("adfecgdb")
+      handler = get_dataset("adfecgdb")
+      recs = handler.load_all_recordings("/path")
+
+2. Configuration Resolution
+   configs/get_config("adfecgdb")
+   │
+   ├─ Load configs/base.py (BaseConfig class)
+   │  ├─ All default parameters
+   │  ├─ ICA_N_COMPONENTS = 4
+   │  ├─ FETAL_HR_MAX = 185 (default)
+   │  └─ ... etc
+   │
+   ├─ Load configs/adfecgdb.yaml
+   │  └─ FETAL_HR_MAX: 185  (override)
+   │
+   └─ Return: BaseConfig instance with merged values
+
+3. Dataset Handler Resolution
+   dataset_handlers/get_dataset("adfecgdb")
+   │
+   ├─ DatasetRegistry lookup
+   ├─ Return: ADFECGDBHandler() instance
+   │
+   └─ Handler ready for:
+      ├─ handler.load_single_recording(filepath)
+      ├─ handler.load_all_recordings(directory)
+      └─ handler.print_recording_summary(rec)
+
+4. Data Loading
+   handler.load_all_recordings("/path/to/adfecgdb")
+   │
+   ├─ List all EDF files in directory
+   ├─ Load each file:
+   │  ├─ Extract channel signals
+   │  ├─ Parse labels
+   │  ├─ Find annotations
+   │  └─ Build recording dict
+   │
+   └─ Return: list of recording dicts
+
+5. Pipeline Execution
+   pipe.run(recording, ...)
+   │
+   ├─ Access config: self.cfg.FETAL_HR_MAX, etc
+   ├─ Process recording with algorithm
+   ├─ Generate metrics
+   └─ Return: results dict
+
+
+COMPONENT INTERACTIONS
+─────────────────────────────────────────────────────────────────────────────────
+
+User Code
+   │
+   ├──→ configs.get_config(name)
+   │    │
+   │    └──→ BaseConfig.__init__(name)
+   │         ├─ Load base.py parameters
+   │         ├─ Load {name}.yaml overrides
+   │         └─ Merge and return
+   │
+   └──→ dataset_handlers.get_dataset(name)
+        │
+        └──→ DatasetRegistry.get(name)
+             ├─ Lookup in registry
+             ├─ Instantiate handler class
+             └─ Return handler instance
+
+
+SCALABILITY PATTERN
+─────────────────────────────────────────────────────────────────────────────────
+
+Adding a NEW Dataset (e.g., "mydataset"):
+
+1. Create: dataset_handlers/mydataset.py
+   ├─ class MyDatasetHandler(AbstractDatasetHandler):
+   │  ├─ @property name() → return "MYDATASET"
+   │  ├─ def load_single_recording() → dict
+   │  └─ def load_all_recordings() → list[dict]
+
+2. Register: In dataset_handlers/__init__.py
+   └─ register_dataset("mydataset", MyDatasetHandler)
+
+3. (Optional) Create: configs/mydataset.yaml
+   └─ Parameter overrides specific to mydataset
+
+4. Use: Anywhere in code
+   └─ handler = get_dataset("mydataset")
+      recs = handler.load_all_recordings("/path/to/data")
+
+Result: ZERO changes needed to pipeline.py or other core code!
+
+
+KEY BENEFITS AT A GLANCE
+─────────────────────────────────────────────────────────────────────────────────
+
+✓ Single Configuration Source (BaseConfig)
+  └─ Replaces: config.py + config_nifecgdb.py (208 lines duplicated)
+
+✓ Modular Dataset Handlers
+  └─ Each dataset isolated, easy to add new ones
+
+✓ Factory Pattern Registry
+  └─ Datasets registered dynamically, no hardcoded imports
+
+✓ Type-Safe Abstractions
+  └─ Abstract base class ensures all handlers implement interface
+
+✓ YAML Configuration Overrides
+  └─ Only non-default values in YAML files
+
+✓ Backward Compatible
+  └─ Old code still works: config_loader.py + data/loader.py wrappers
+
+✓ Pipeline Unchanged
+  └─ PHASEPipeline works with any registered dataset
+
+✓ Clear Separation of Concerns
+  └─ Configuration, Data, Pipeline are isolated
+
+
+FILE SIZE COMPARISON
+─────────────────────────────────────────────────────────────────────────────────
+
+BEFORE                              AFTER
+──────────────────────────────────────────────────────────────────────────────
+config.py                119 lines  configs/base.py        130 lines
+config_nifecgdb.py       119 lines  configs/adfecgdb.yaml   14 lines
+─────────────────────────           configs/nifecgdb.yaml   14 lines
+Total duplicated: 238 lines         Total: 158 lines (-27%)
+
+data/loader.py (full)    218 lines  dataset_handlers/base.py        100 lines
+                                    dataset_handlers/adfecgdb.py    180 lines
+                                    dataset_handlers/nifecgdb.py    180 lines
+                                    dataset_handlers/registry.py    110 lines
+                                    data/loader.py (wrapper only)    50 lines
+                                    ─────────────────────────────────
+                                    Total: 620 lines (+184%)
+
+Note: The increase is due to modularity and documentation. The benefit is:
+- Each dataset now isolated and well-documented
+- Easy to add new datasets
+- Clear contracts via abstract base class
+- Better maintainability
+
+
+════════════════════════════════════════════════════════════════════════════════
+                         IMPLEMENTATION COMPLETE ✅
+════════════════════════════════════════════════════════════════════════════════

@@ -8,18 +8,19 @@ return statement in adaptive_windowed_wsvd. Only the most complete version
 """
 
 import numpy as np
-from config import (
-    FS, QRS_SIGMA_SEC, QRS_BASELINE_WEIGHT,
-    WSVD_WINDOW_SEC, WSVD_OVERLAP, WSVD_N_COMPONENTS,
-    WSVD_COMPONENT_CORR_THRESH, WSVD_MAX_ENERGY_REMOVAL,
-    WSVD_CHANNEL_R2_MIN
-)
-from config_nifecgdb import (
-    FS, QRS_SIGMA_SEC, QRS_BASELINE_WEIGHT,
-    WSVD_WINDOW_SEC, WSVD_OVERLAP, WSVD_N_COMPONENTS,
-    WSVD_COMPONENT_CORR_THRESH, WSVD_MAX_ENERGY_REMOVAL,
-    WSVD_CHANNEL_R2_MIN
-)
+from configs import BaseConfig
+
+# Use BaseConfig defaults (shared across all datasets)
+_cfg = BaseConfig()
+FS = _cfg.FS
+QRS_SIGMA_SEC = _cfg.QRS_SIGMA_SEC
+QRS_BASELINE_WEIGHT = _cfg.QRS_BASELINE_WEIGHT
+WSVD_WINDOW_SEC = _cfg.WSVD_WINDOW_SEC
+WSVD_OVERLAP = _cfg.WSVD_OVERLAP
+WSVD_N_COMPONENTS = _cfg.WSVD_N_COMPONENTS
+WSVD_COMPONENT_CORR_THRESH = _cfg.WSVD_COMPONENT_CORR_THRESH
+WSVD_MAX_ENERGY_REMOVAL = _cfg.WSVD_MAX_ENERGY_REMOVAL
+WSVD_CHANNEL_R2_MIN = _cfg.WSVD_CHANNEL_R2_MIN
 
 def gaussian_weight_matrix(n_samples: int, qrs_peaks: np.ndarray,
                             fs: int = FS,

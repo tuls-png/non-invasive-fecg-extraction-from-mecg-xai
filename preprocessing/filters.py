@@ -19,14 +19,17 @@ scale_signal() is retained as a utility for use AFTER ICA, e.g. before EKF.
 
 import numpy as np
 from scipy.signal import butter, filtfilt, iirnotch, medfilt
-from config import (
-    FS, BANDPASS_LOW, BANDPASS_HIGH, BANDPASS_ORDER,
-    NOTCH_FREQ, NOTCH_QUALITY, MEDFILT_KERNEL
-)
-from config_nifecgdb import (
-    FS, BANDPASS_LOW, BANDPASS_HIGH, BANDPASS_ORDER,
-    NOTCH_FREQ, NOTCH_QUALITY, MEDFILT_KERNEL
-)
+from configs import BaseConfig
+
+# Use BaseConfig defaults (shared across all datasets)
+_cfg = BaseConfig()
+FS = _cfg.FS
+BANDPASS_LOW = _cfg.BANDPASS_LOW
+BANDPASS_HIGH = _cfg.BANDPASS_HIGH
+BANDPASS_ORDER = _cfg.BANDPASS_ORDER
+NOTCH_FREQ = _cfg.NOTCH_FREQ
+NOTCH_QUALITY = _cfg.NOTCH_QUALITY
+MEDFILT_KERNEL = _cfg.MEDFILT_KERNEL
 
 
 def bandpass_filter(signal: np.ndarray, fs: int = FS,

@@ -23,7 +23,7 @@ except ImportError as e:
 
 try:
     sys.path.insert(0, str(Path(__file__).parent))
-    from config import FS;                               print(f"config OK — FS={FS}")
+    from configs import BaseConfig; _cfg = BaseConfig(); FS = _cfg.FS; print(f"config OK — FS={FS}")
     from data.loader import load_edf;                    print("loader OK")
     from preprocessing.filters import preprocess_channel; print("filters OK")
     from preprocessing.qrs_detector import detect_fetal_qrs; print("qrs_detector OK")

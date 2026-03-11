@@ -38,6 +38,7 @@ from separation.wsvd import (
 from separation.ekf import FetalECGKalmanFilter
 from evaluation.metrics import evaluate
 from xai.echo import ECHOExplainer
+from preprocessing.qrs_detector import load_wfdb_annotation
 
 
 def _min_usable_peaks(duration_sec: float, cfg, dataset: str = "ADFECGDB") -> int:
@@ -54,8 +55,8 @@ def _norm(sig):
     return sig / (np.std(sig) + 1e-10)
 
 
-def _candidate_hr(sig, fs):
-    peaks   = detect_fetal_qrs(sig, fs)
+def _candidate_hr(sig, fs, cfg):
+    peaks   = detect_fetal_qrs(sig, fs, cfg=cfg)
     stats   = compute_hr_stats(peaks, fs)
     mean_hr = stats["mean_hr"] if len(peaks) >= 2 else np.nan
     return peaks, mean_hr
@@ -71,6 +72,7 @@ def _is_fetal_hr(mean_hr: float, maternal_hr: float, cfg) -> bool:
     from HR_SEP_MIN_BPM to HR_SEP_MIN_BPM * 0.7 to avoid rejecting valid
     fetal ICs that happen to be in the lower fetal range.
     """
+    print("HR_SEP_MIN_BPM", cfg.HR_SEP_MIN_BPM )
     if np.isnan(mean_hr):
         return False
     in_range = cfg.FETAL_HR_LOW <= mean_hr <= cfg.FETAL_HR_HIGH
@@ -125,7 +127,7 @@ def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
                 print(f"[PHASE]   {label} IC{i+1}: skipped (zero-variance pad)")
             continue
         sig_norm       = _norm(ic)
-        peaks, mean_hr = _candidate_hr(sig_norm, fs)
+        peaks, mean_hr = _candidate_hr(sig_norm, fs, cfg)
         n_peaks        = len(peaks)
         passes_hr      = _is_fetal_hr(mean_hr, maternal_hr, cfg)
         hr_sc          = _hr_score(mean_hr, cfg, expected_hr)
@@ -170,7 +172,7 @@ def _refine_peaks_on_smoothed(smoothed, rough_peaks, fs, search_radius_ms=40.0):
         refined.append(local_max)
     return np.array(refined, dtype=int)
 
-def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts):
+def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts, cfg=None):
     if len(fetal_peaks) < 5:
         return fetal_ic
     hr_init = compute_hr_stats(fetal_peaks, fs)["mean_hr"]
@@ -179,7 +181,7 @@ def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts):
     ekf = FetalECGKalmanFilter(fs=fs, fetal_hr_init=hr_init)
     out = (ekf.smooth(fetal_ic, detected_peaks=fetal_peaks) if use_rts
            else ekf.filter(fetal_ic, detected_peaks=fetal_peaks)[0])
-    peaks_post = detect_fetal_qrs(out, fs)
+    peaks_post = detect_fetal_qrs(out, fs, cfg=cfg)
     if len(peaks_post) < max(10, len(fetal_peaks) * 0.3):
         return fetal_ic
     return out
@@ -230,17 +232,21 @@ class PHASEPipeline:
         maternal_hr    = mat_hr_stats["mean_hr"]
         self._log(f"  {len(maternal_peaks)} maternal peaks, HR = {maternal_hr:.1f} BPM")
 
-        ann_path     = recording.get("annotation_path")
-        expected_fhr = None
-        if ann_path and dataset == "ADFECGDB":
-            ann_peaks = load_adfecgdb_annotation(ann_path)
+        ann_path      = recording.get("annotation_path")
+        ann_ext       = recording.get("annotation_ext", "qrs")
+        ann_is_fetal  = recording.get("annotation_is_fetal", False)
+        expected_fhr  = None
+
+        if ann_path and ann_is_fetal:
+            from preprocessing.qrs_detector import load_wfdb_annotation
+            ann_peaks = load_wfdb_annotation(ann_path, ann_ext)
             if len(ann_peaks) >= 5:
                 ann_stats    = compute_hr_stats(ann_peaks, fs)
                 expected_fhr = ann_stats["mean_hr"]
                 self._log(f"  Annotation prior: {len(ann_peaks)} peaks, "
                         f"expected fetal HR = {expected_fhr:.1f} BPM")
-        elif ann_path and dataset == "NIFECGDB":
-            self._log("  Annotation skipped (NIFECGDB .qrs = maternal beats)")
+        elif ann_path and not ann_is_fetal:
+            self._log("  Annotation skipped (not fetal ground truth)")
 
         # Step 4: Path A
         self._log("Step 4: Path A -- ICA1 direct (HR-aware scan)...")
@@ -315,27 +321,27 @@ class PHASEPipeline:
             fetal_ecg = fetal_ic_raw
             self._log("  EKF bypassed")
         else:
-            fetal_ecg = _apply_ekf(fetal_ic_raw, chosen_peaks, fs, self.use_rts)
-            n_post = len(detect_fetal_qrs(fetal_ecg, fs))
+            fetal_ecg = _apply_ekf(fetal_ic_raw, chosen_peaks, fs, self.use_rts, cfg=cfg)
+            n_post = len(detect_fetal_qrs(fetal_ecg, fs, cfg=cfg))
             self._log(f"  EKF complete -- {n_post} peaks post-EKF (was {len(chosen_peaks)})")
 
         # Step 11: Final QRS
         self._log("Step 11: Final fetal QRS detection...")
-        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs)
+        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
         fet_hr = compute_hr_stats(fetal_peaks, fs)
         self._log(f"  {len(fetal_peaks)} peaks, HR = {fet_hr['mean_hr']:.1f} BPM")
 
         # Step 12: Evaluation
         self._log("Step 12: Evaluation...")
-        if ann_path and dataset == "ADFECGDB":
-            ref_peaks = load_adfecgdb_annotation(ann_path)
-            self._log(f"  Reference: .qrs annotation -- {len(ref_peaks)} peaks")
+        if ann_path and ann_is_fetal:
+            ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
+            self._log(f"  Reference: .{ann_ext} annotation — {len(ref_peaks)} peaks")
         elif dir_proc is not None:
             ref_peaks = detect_reference_fetal_qrs(dir_proc, fs)
-            self._log(f"  Reference: Direct_1 detector -- {len(ref_peaks)} peaks")
+            self._log(f"  Reference: Direct_1 detector — {len(ref_peaks)} peaks")
         else:
             ref_peaks = np.array([])
-            self._log("  Reference: none available (NIFECGDB)")
+            self._log("  Reference: none available")
         metrics = evaluate(
                 fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
                 label=f"PHASE ({rec_id})",
@@ -417,7 +423,7 @@ class PHASEPipeline:
         ICs2_1, _   = run_ica(residual_1)
         corrs       = [abs(np.corrcoef(ic, dir_proc)[0, 1]) for ic in ICs2_1]
         ic_base     = _norm(ICs2_1[int(np.argmax(corrs))])
-        pks_base    = detect_fetal_qrs(ic_base, fs)
+        pks_base    = detect_fetal_qrs(ic_base, fs, cfg=self.cfg)
         results["1_Baseline_ICA_WSVD"] = _eval(ic_base, pks_base, "Baseline ICA+WSVD")
 
         # Config 2: + Blind IC selection
@@ -452,8 +458,8 @@ class PHASEPipeline:
 
         # Config 5: + EKF-RTS
         self._log("  Config 5: Full PHASE (+ EKF-RTS)...")
-        fetal_ecg_5 = _apply_ekf(sig_4, pks_4, fs, use_rts=True)
-        pks_5       = detect_fetal_qrs(fetal_ecg_5, fs)
+        fetal_ecg_5 = _apply_ekf(sig_4, pks_4, fs, use_rts=True, cfg=self.cfg)
+        pks_5       = detect_fetal_qrs(fetal_ecg_5, fs, cfg=self.cfg)
         if len(pks_5) < max(10, len(pks_4) * 0.3):
             fetal_ecg_5, pks_5 = sig_4, pks_4
         results["5_PHASE_Full"] = _eval(fetal_ecg_5, pks_5, "PHASE Full")
@@ -469,18 +475,31 @@ class PHASEPipeline:
         )
         fdir = Path(figures_dir)
         fdir.mkdir(parents=True, exist_ok=True)
+
         plot_preprocessing(
             recording["abdomen"][0], abd_proc[0], self.fs,
             save_path=str(fdir / f"{rec_id}_preprocessing.png"))
+
         plot_maternal_cancellation(
             abd_proc, maternal_recon, residual, self.fs,
             save_path=str(fdir / f"{rec_id}_maternal_cancellation.png"))
+
+        # Pass None for reference if no direct electrode available
+        has_direct = dir_proc is not None and hasattr(dir_proc, '__len__') and len(dir_proc) > 0
         plot_fetal_comparison(
-            fetal_ecg, dir_proc, fetal_peaks, ref_peaks, self.fs,
+            fetal_ecg,
+            dir_proc if has_direct else None,
+            fetal_peaks,
+            ref_peaks if has_direct else None,
+            self.fs,
             save_path=str(fdir / f"{rec_id}_fetal_comparison.png"))
+
         plot_ekf_refinement(
-            fetal_ic_raw, fetal_ecg, dir_proc, self.fs,
+            fetal_ic_raw, fetal_ecg,
+            dir_proc if has_direct else None,
+            self.fs,
             save_path=str(fdir / f"{rec_id}_ekf_refinement.png"))
+
         echo.plot_attribution_heatmap(
             save_path=str(fdir / f"{rec_id}_echo_attribution.png"))
         self._log(f"Figures saved to {figures_dir}/")

@@ -15,16 +15,18 @@ CHANGES FROM ORIGINAL:
 """
 
 import numpy as np
-from config import (
-    FS, EKF_FETAL_HR_INIT, EKF_PROCESS_NOISE,
-    EKF_OBSERVE_NOISE, EKF_STATE_COV_INIT, EKF_PQRST_PARAMS,
-    FETAL_HR_MIN, FETAL_HR_MAX,
-)
-from config_nifecgdb import (
-    FS, EKF_FETAL_HR_INIT, EKF_PROCESS_NOISE,
-    EKF_OBSERVE_NOISE, EKF_STATE_COV_INIT, EKF_PQRST_PARAMS,
-    FETAL_HR_MIN, FETAL_HR_MAX,
-)
+from configs import BaseConfig
+
+# Use BaseConfig defaults (shared across all datasets)
+_cfg = BaseConfig()
+FS = _cfg.FS
+EKF_FETAL_HR_INIT = _cfg.EKF_FETAL_HR_INIT
+EKF_PROCESS_NOISE = _cfg.EKF_PROCESS_NOISE
+EKF_OBSERVE_NOISE = _cfg.EKF_OBSERVE_NOISE
+EKF_STATE_COV_INIT = _cfg.EKF_STATE_COV_INIT
+EKF_PQRST_PARAMS = _cfg.EKF_PQRST_PARAMS
+FETAL_HR_MIN = _cfg.FETAL_HR_MIN
+FETAL_HR_MAX = _cfg.FETAL_HR_MAX
 
 
 

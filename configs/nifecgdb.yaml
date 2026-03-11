@@ -1,0 +1,17 @@
+# NIFECGDB Dataset Configuration
+# Overrides to BaseConfig for NIFECGDB
+#
+# NIFECGDB characteristics:
+# - No direct fetal ECG electrode (abdominal only)
+# - Higher maternal heart rates (active labor scenarios)
+# - Longer, variable recordings
+# - .edf.qrs annotations only
+
+maternal_hr_min: 50
+maternal_hr_max: 115
+fetal_hr_min: 100
+fetal_hr_max: 200
+fetal_hr_low: 100
+fetal_hr_high: 200
+fetal_hr_centre: 140
+ekf_fetal_hr_init: 140

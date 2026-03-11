@@ -33,8 +33,11 @@ that justifies its inclusion as a novel contribution.
 
 import numpy as np
 from scipy.signal import butter, filtfilt
-from config import FS
-from config_nifecgdb import FS
+from configs import BaseConfig
+
+# Use BaseConfig defaults (shared across all datasets)
+_cfg = BaseConfig()
+FS = _cfg.FS
 
 
 def extract_maternal_template(abd_signals: np.ndarray,

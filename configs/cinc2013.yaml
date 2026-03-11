@@ -1,0 +1,19 @@
+# configs/cinc2013.yaml
+# CinC 2013 Challenge Set A overrides
+#
+# CinC2013 characteristics:
+# - Active labor recordings (same gestational stage as ADFECGDB)
+# - 4 abdominal channels, 1000 Hz, 1-minute duration
+# - Fetal QRS annotations in .fqrs (crowd-sourced, direct ECG reference)
+# - No direct electrode in released data
+# - Multiple recording sources — heterogeneous SNR
+
+maternal_hr_min: 50
+maternal_hr_max: 115
+fetal_hr_min: 100
+fetal_hr_max: 200
+fetal_hr_low: 100
+fetal_hr_high: 200
+fetal_hr_centre: 130
+ekf_fetal_hr_init: 140
+# hr_sep_min_bpm: 10

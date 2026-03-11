@@ -1,0 +1,17 @@
+# ADFECGDB Dataset Configuration
+# Overrides to BaseConfig for ADFECGDB
+# 
+# ADFECGDB characteristics:
+# - Direct fetal ECG electrode available
+# - Standard adult maternal heart rates
+# - Shorter, controlled recordings
+# - .edf.qrs annotations available
+
+maternal_hr_min: 55
+maternal_hr_max: 110
+fetal_hr_min: 100
+fetal_hr_max: 185
+fetal_hr_low: 100
+fetal_hr_high: 185
+fetal_hr_centre: 130
+ekf_fetal_hr_init: 150

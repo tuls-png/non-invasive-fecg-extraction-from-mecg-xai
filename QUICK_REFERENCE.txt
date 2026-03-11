@@ -1,0 +1,213 @@
+QUICK REFERENCE CARD
+════════════════════════════════════════════════════════════════════════════════
+
+RUNNING EXPERIMENTS WITH NEW STRUCTURE
+════════════════════════════════════════════════════════════════════════════════
+
+1. FULL ADFECGDB EXPERIMENT
+   $ python run_experiment_new.py --dataset adfecgdb --mode full
+
+2. FULL NIFECGDB EXPERIMENT
+   $ python run_experiment_new.py --dataset nifecgdb --mode full
+
+3. LIMITED NIFECGDB (first 10 recordings)
+   $ python run_experiment_new.py --dataset nifecgdb --mode full --max_recordings 10
+
+4. SINGLE RECORDING
+   $ python run_experiment_new.py --dataset adfecgdb --mode single
+
+5. ABLATION STUDY
+   $ python run_experiment_new.py --dataset adfecgdb --mode ablation
+
+
+PYTHON CODE EXAMPLES
+════════════════════════════════════════════════════════════════════════════════
+
+LOADING DATA:
+─────────────
+from dataset_handlers import get_dataset
+
+handler = get_dataset("adfecgdb")
+recordings = handler.load_all_recordings("/path/to/adfecgdb")
+
+for rec in recordings:
+    handler.print_recording_summary(rec)
+
+
+ACCESSING CONFIG:
+─────────────────
+from configs import get_config
+
+config = get_config("adfecgdb")
+print(config.FETAL_HR_MAX)          # 185
+print(config.ICA_N_COMPONENTS)      # 4
+print(config.dataset)                # 'adfecgdb'
+
+
+RUNNING PIPELINE:
+─────────────────
+from configs import get_config
+from dataset_handlers import get_dataset
+from pipeline import PHASEPipeline
+
+config = get_config("adfecgdb")
+handler = get_dataset("adfecgdb")
+pipe = PHASEPipeline(verbose=True, dataset="adfecgdb")
+
+recordings = handler.load_all_recordings("/path/to/data")
+for rec in recordings:
+    result = pipe.run(rec, save_figures=True)
+    print(f"Recording {rec['recording']}: F1 = {result['metrics']['F1']:.4f}")
+
+
+REGISTERING A NEW DATASET:
+──────────────────────────
+from dataset_handlers import AbstractDatasetHandler, register_dataset
+
+class MyDatasetHandler(AbstractDatasetHandler):
+    @property
+    def name(self):
+        return "MYDATASET"
+    
+    def load_single_recording(self, filepath):
+        # Your loading logic here
+        return {
+            "recording": "...",
+            "dataset": self.name,
+            "fs": 1000,
+            "duration_sec": 100.0,
+            "abdomen": np.zeros((4, 100000)),
+            "direct": None,
+            "labels": [],
+            "annotation_path": None,
+        }
+    
+    def load_all_recordings(self, directory, max_recordings=None):
+        # Your directory loading logic here
+        return []
+
+# Register it
+register_dataset("mydataset", MyDatasetHandler)
+
+# Use it
+handler = get_dataset("mydataset")
+
+
+KEY FILES REFERENCE
+════════════════════════════════════════════════════════════════════════════════
+
+CONFIGS:
+  configs/__init__.py   → get_config() function
+  configs/base.py       → BaseConfig class with all parameters
+  configs/adfecgdb.yaml → ADFECGDB parameter overrides
+  configs/nifecgdb.yaml → NIFECGDB parameter overrides
+
+HANDLERS:
+  dataset_handlers/__init__.py  → get_dataset(), register_dataset()
+  dataset_handlers/base.py      → AbstractDatasetHandler
+  dataset_handlers/adfecgdb.py  → ADFECGDBHandler
+  dataset_handlers/nifecgdb.py  → NIFECGDBHandler
+  dataset_handlers/registry.py  → DatasetRegistry
+
+BACKWARD COMPAT:
+  config_loader.py  → Legacy wrapper (use configs module instead)
+  data/loader.py    → Legacy wrapper (use dataset_handlers instead)
+
+DOCUMENTATION:
+  STREAMLINED_STRUCTURE_GUIDE.md → Complete architecture guide
+  REFACTORING_COMPLETE.md        → Implementation summary
+  QUICK_REFERENCE.txt            → This file
+
+
+COMMON PATTERNS
+════════════════════════════════════════════════════════════════════════════════
+
+Pattern 1: Process all recordings
+──────────────────────────────────
+from dataset_handlers import get_dataset
+
+handler = get_dataset("adfecgdb")
+recordings = handler.load_all_recordings("/path/to/data")
+for rec in recordings:
+    # Do something with rec
+    pass
+
+
+Pattern 2: Switch between datasets with one param
+──────────────────────────────────────────────────
+def run_analysis(dataset_name, data_dir):
+    from configs import get_config
+    from dataset_handlers import get_dataset
+    
+    config = get_config(dataset_name)
+    handler = get_dataset(dataset_name)
+    recordings = handler.load_all_recordings(data_dir)
+    # Rest of code uses recorded recordings
+    return recordings
+
+run_analysis("adfecgdb", "/path/to/adfecgdb")
+run_analysis("nifecgdb", "/path/to/nifecgdb")
+
+
+Pattern 3: Dataset-agnostic pipeline
+──────────────────────────────────────
+def process_dataset(dataset_name):
+    from configs import get_config
+    from dataset_handlers import get_dataset
+    from pipeline import PHASEPipeline
+    
+    config = get_config(dataset_name)
+    handler = get_dataset(dataset_name)
+    pipe = PHASEPipeline(verbose=True, dataset=dataset_name)
+    
+    recordings = handler.load_all_recordings(f"/path/to/{dataset_name}")
+    results = []
+    
+    for rec in recordings:
+        result = pipe.run(rec)
+        results.append(result["metrics"])
+    
+    return results
+
+# Works for any registered dataset!
+metrics_adf = process_dataset("adfecgdb")
+metrics_nif = process_dataset("nifecgdb")
+
+
+TROUBLESHOOTING
+════════════════════════════════════════════════════════════════════════════════
+
+Q: ModuleNotFoundError: No module named 'dataset_handlers'
+A: Make sure you're in the project root directory, or add the path:
+   import sys
+   sys.path.insert(0, '/path/to/FETALECGSEPARATION')
+
+Q: KeyError: Dataset 'mydataset' not registered
+A: Register it first:
+   from dataset_handlers import register_dataset
+   register_dataset("mydataset", MyDatasetHandler)
+
+Q: Getting old config values
+A: Import from configs instead of config_loader:
+   from configs import get_config
+   (The new module merges base configs with YAML overrides)
+
+Q: YAML parsing error
+A: Install PyYAML:
+   pip install PyYAML
+
+
+ADDITIONAL HELP
+════════════════════════════════════════════════════════════════════════════════
+
+For comprehensive documentation, see:
+  → STREAMLINED_STRUCTURE_GUIDE.md
+
+For implementation details, see:
+  → REFACTORING_COMPLETE.md
+
+For example usage, run:
+  → python run_experiment_new.py --help
+
+To validate setup:
+  → python test_streamlined_architecture.py
