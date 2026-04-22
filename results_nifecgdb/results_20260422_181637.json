@@ -1,0 +1,38 @@
+[
+  {
+    "timestamp": "20260422_181637",
+    "recording": "ecgca102",
+    "method": "PHASE_nifecgdb",
+    "SNR_dB": null,
+    "PRD_pct": null,
+    "RMSE": null,
+    "CC": null,
+    "Se": 39.7333,
+    "PPV": 36.165,
+    "F1": 37.8653,
+    "TP": 149.0,
+    "FP": 263.0,
+    "FN": 226.0,
+    "FHR_MAE_bpm": 32.4673,
+    "n_detected": 412.0,
+    "n_reference": 375.0
+  },
+  {
+    "timestamp": "20260422_181637",
+    "recording": "ecgca115",
+    "method": "PHASE_nifecgdb",
+    "SNR_dB": null,
+    "PRD_pct": null,
+    "RMSE": null,
+    "CC": null,
+    "Se": 49.651,
+    "PPV": 47.4562,
+    "F1": 48.5288,
+    "TP": 569.0,
+    "FP": 630.0,
+    "FN": 577.0,
+    "FHR_MAE_bpm": 28.8356,
+    "n_detected": 1199.0,
+    "n_reference": 1146.0
+  }
+]

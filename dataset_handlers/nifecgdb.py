@@ -128,7 +128,9 @@ class NIFECGDBHandler(AbstractDatasetHandler):
             "duration_sec": N / fs_rec,
             "abdomen": abdomen,
             "direct": None,  # No direct electrode for NIFECGDB
-            "annotation_path": str(ann_path) if ann_path.exists() else None,
+            "annotation_path": str(filepath.parent / filepath.name) if ann_path.exists() else None,
+            "annotation_ext": "qrs",
+            "annotation_is_fetal": True,  # NIFECGDB .qrs contain maternal beats, not fetal
             "n_abd_channels": n_abd,
         }
 

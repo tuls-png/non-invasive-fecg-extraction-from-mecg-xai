@@ -8,7 +8,8 @@ FIX: plot_ablation_results() previously tried to read error bars from
 ablation_data.get("_std", {}) which was never populated by run_ablation().
 Error bars are now passed as a separate optional std_data dict.
 """
-
+import matplotlib
+matplotlib.use('Agg')
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path

@@ -1,0 +1,3 @@
+timestamp,recording,method,SNR_dB,PRD_pct,RMSE,CC,Se,PPV,F1,TP,FP,FN,FHR_MAE_bpm,n_detected,n_reference
+20260422_181637,ecgca102,PHASE_nifecgdb,,,,,39.7333,36.165,37.8653,149.0,263.0,226.0,32.4673,412.0,375.0
+20260422_181637,ecgca115,PHASE_nifecgdb,,,,,49.651,47.4562,48.5288,569.0,630.0,577.0,28.8356,1199.0,1146.0

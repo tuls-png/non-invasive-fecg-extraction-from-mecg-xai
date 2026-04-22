@@ -10,7 +10,8 @@ Usage:
     python run_experiment_new.py --dataset nifecgdb --mode full --max_recordings 10
     python run_experiment_new.py --dataset adfecgdb --mode single --recording r01.edf
 """
-
+import matplotlib
+matplotlib.use('Agg')
 import sys
 import argparse
 import numpy as np
