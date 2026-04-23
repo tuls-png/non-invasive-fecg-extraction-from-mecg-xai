@@ -92,7 +92,8 @@ class BaseConfig:
     # -- Evaluation ---------------------------------------------------------------
     EVAL_TOLERANCE_MS = 50
     EVAL_MIN_PEAK_HEIGHT = 0.35
-    EVAL_MIN_PEAK_DISTANCE_SEC = 0.33
+    # FIX 3: EVAL_MIN_PEAK_DISTANCE_SEC derived from 60/FETAL_HR_MAX (set in __init__)
+    EVAL_MIN_PEAK_DISTANCE_SEC = None  # Computed dynamically in __init__
 
     # -- ECHO XAI -----------------------------------------------------------------
     ECHO_MATERNAL_EXCLUSION_SEC = 0.08
@@ -122,6 +123,11 @@ class BaseConfig:
         self.dataset = dataset.lower()
         self._load_overrides()
         np.random.seed(self.RANDOM_SEED)
+        
+        # FIX 3: Compute EVAL_MIN_PEAK_DISTANCE_SEC dynamically from FETAL_HR_MAX
+        # Minimum peak distance = minimum RR interval = 60 sec / max HR
+        if self.EVAL_MIN_PEAK_DISTANCE_SEC is None:
+            self.EVAL_MIN_PEAK_DISTANCE_SEC = 60.0 / self.FETAL_HR_MAX
 
     def _load_overrides(self):
         """Load and apply dataset-specific YAML overrides if they exist."""

@@ -46,6 +46,43 @@ from scipy.signal import butter, filtfilt, find_peaks
 from preprocessing.qrs_detector import pan_tompkins, compute_hr_stats
 
 
+def _estimate_dominant_frequency(signal: np.ndarray, fs: int = FS,
+                                   freq_low: float = 1.0,
+                                   freq_high: float = 5.0) -> float:
+    """
+    Estimate dominant frequency in given band using FFT.
+    
+    Used for FIX 5: spectral separation check in CinC2013 IC selection.
+    
+    Parameters
+    ----------
+    signal : (N,) input signal
+    fs : sampling rate (Hz)
+    freq_low : lower bound of frequency band (Hz)
+    freq_high : upper bound of frequency band (Hz)
+    
+    Returns
+    -------
+    freq : dominant frequency (Hz), or np.nan if no power found
+    """
+    N = len(signal)
+    fft_vals = np.fft.fft(signal)
+    freqs = np.fft.fftfreq(N, 1.0 / fs)
+    
+    # Only positive frequencies
+    mask = freqs >= 0
+    freqs = freqs[mask]
+    magnitude = np.abs(fft_vals[mask])
+    
+    # Restrict to band of interest
+    band_mask = (freqs >= freq_low) & (freqs <= freq_high)
+    if not np.any(band_mask):
+        return np.nan
+    
+    dominant_idx = np.argmax(magnitude[band_mask])
+    return float(freqs[band_mask][dominant_idx])
+
+
 def run_ica(signals: np.ndarray,
             n_components: int = ICA_N_COMPONENTS) -> tuple[np.ndarray, FastICA]:
     """
@@ -255,11 +292,27 @@ def select_fetal_ic(ICs: np.ndarray,
                     maternal_peaks: np.ndarray,
                     maternal_idx: int,
                     fs: int = FS,
-                    residual: np.ndarray = None) -> tuple[int, list[float]]:
+                    residual: np.ndarray = None,
+                    cfg: BaseConfig = None) -> tuple[int, list[float]]:
     """
     Select the fetal IC from ICA components.
-    maternal_idx kept for API compatibility; exclusion is handled upstream.
+    
+    FIX 5 (CinC2013): After HR-gating, verify spectral separation from maternal.
+    Requires peak-frequency in [FETAL_HR_MIN/60, FETAL_HR_MAX/60] Hz distinct
+    from maternal frequency by >= HR_SEP_MIN_BPM/60 Hz.
+    
+    Parameters
+    ----------
+    ICs : (n_comp, N) independent components
+    maternal_peaks : (K,) maternal QRS indices
+    maternal_idx : maternal IC index (for API compatibility)
+    fs : sampling rate
+    residual : residual signal (for fallback)
+    cfg : BaseConfig (optional, for CinC2013 spectral checks)
     """
+    if cfg is None:
+        cfg = _cfg
+    
     scores   = [score_fetal_ic(ic, maternal_peaks, fs) for ic in ICs]
     best_idx = int(np.argmax(scores))
 
@@ -273,6 +326,43 @@ def select_fetal_ic(ICs: np.ndarray,
                     best_cc  = cc
                     best_idx = i
         print(f"[ICA] Fallback selected IC{best_idx+1} (best residual CC={best_cc:.4f})")
+    
+    # FIX 5: Spectral separation check (CinC2013)
+    # Estimate maternal frequency from maternal peaks
+    mat_freq = np.nan
+    if len(maternal_peaks) > 1:
+        mat_hr = compute_hr_stats(maternal_peaks, fs)["mean_hr"]
+        mat_freq = mat_hr / 60.0  # Convert to Hz
+    
+    # Check spectral separation for top candidates
+    if not np.isnan(mat_freq) and cfg.dataset.lower() == "cinc2013":
+        fetal_freq_min = cfg.FETAL_HR_MIN / 60.0
+        fetal_freq_max = cfg.FETAL_HR_MAX / 60.0
+        freq_sep_min = cfg.HR_SEP_MIN_BPM / 60.0
+        
+        spectral_scores = []
+        for i, ic in enumerate(ICs):
+            fetal_freq = _estimate_dominant_frequency(ic, fs, freq_low=fetal_freq_min-0.5, freq_high=fetal_freq_max+0.5)
+            
+            freq_in_range = (not np.isnan(fetal_freq)) and (fetal_freq_min <= fetal_freq <= fetal_freq_max)
+            freq_separated = (not np.isnan(fetal_freq)) and (abs(fetal_freq - mat_freq) >= freq_sep_min)
+            
+            spec_score = 0.0
+            if freq_in_range and freq_separated:
+                spec_score = 1.0
+            
+            spectral_scores.append(spec_score)
+            if i == best_idx:
+                print(f"[ICA-SPEC] IC{i+1} (best): fetal_freq={fetal_freq:.2f}Hz, "
+                      f"maternal_freq={mat_freq:.2f}Hz, separated={freq_separated}, "
+                      f"in_range={freq_in_range}")
+        
+        # Re-select if top candidate fails spectral check
+        valid_idx = [i for i in range(len(ICs)) if spectral_scores[i] > 0.5]
+        if valid_idx and best_idx not in valid_idx:
+            # Choose best non-failing candidate
+            best_idx = valid_idx[np.argmax([scores[i] for i in valid_idx])]
+            print(f"[ICA-SPEC] Re-selected to IC{best_idx+1} due to spectral separation")
 
     print(f"\n[ICA] Fetal IC selection scores:")
     for i, s in enumerate(scores):

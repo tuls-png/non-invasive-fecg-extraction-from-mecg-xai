@@ -16,4 +16,13 @@ fetal_hr_low: 100
 fetal_hr_high: 200
 fetal_hr_centre: 130
 ekf_fetal_hr_init: 140
-# hr_sep_min_bpm: 10
+
+# FIX 2: Lower WSVD thresholds to trigger cancellation on high-maternal-SNR recordings
+wsvd_component_corr_thresh: 0.15
+wsvd_channel_r2_min: 0.20
+
+# FIX 4: Change BANDPASS_LOW to 5.0 Hz to match ADFECGDB (avoid baseline drift)
+bandpass_low: 5.0
+
+# FIX 6: Lower PT_THRESHOLD_FACTOR to recover weak fetal beats post-subtraction
+pt_threshold_factor: 0.5
