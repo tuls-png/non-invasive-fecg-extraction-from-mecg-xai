@@ -407,22 +407,62 @@ class PHASEPipeline:
             ts_input, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2)
         residual = subtract_maternal(ts_input, maternal_recon)
 
-        # Step 7: ICA2 on residual
-        self._log("Step 7: ICA2 on residual...")
+        # Step 8: Path B -- ICA2 with [FIX-1] maternal residual exclusion
+        self._log("Step 8: Path B -- ICA2 on residual (HR-aware scan)...")
         ICs2, _          = run_ica(residual, n_components=cfg.ICA_N_COMPONENTS)
         mat_residual_idx = _find_maternal_residual_idx(ICs2, maternal_ic, cfg)
         b_sig, b_idx, b_peaks, b_hr = _best_ic(
             ICs2, mat_residual_idx, maternal_hr, fs, cfg,
-            label="ICA2", expected_hr=expected_fhr, min_peaks=min_peaks)
+            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks)
         b_n     = len(b_peaks)
         b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
-        self._log(f"  ICA2: IC{b_idx+1}, {b_n} peaks, "
+        self._log(f"  Path B: IC{b_idx+1}, {b_n} peaks, "
                   f"HR={b_hr:.1f} BPM, valid={'YES' if b_valid else 'NO'}")
 
-        # Evaluation for steps 1-7
-        self._log("Evaluation for steps 1-7...")
-        fetal_ecg = b_sig
-        fetal_peaks = b_peaks
+        # Step 9: Select best path
+        self._log("Step 9: Selecting best path...")
+        if a_valid and b_valid:
+            if a_n >= b_n * cfg.PATH_A_PREFERENCE:
+                chosen_sig, chosen_peaks = a_sig, a_peaks
+                chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
+            else:
+                chosen_sig, chosen_peaks = b_sig, b_peaks
+                chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
+        elif a_valid:
+            chosen_sig, chosen_peaks = a_sig, a_peaks
+            chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
+        elif b_valid:
+            chosen_sig, chosen_peaks = b_sig, b_peaks
+            chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
+        else:
+            a_score = _hr_score(a_hr)
+            b_score = _hr_score(b_hr)
+            if a_score >= b_score:
+                chosen_sig, chosen_peaks = a_sig, a_peaks
+                chosen_path = f"A_fallback_IC{a_idx+1}_{a_hr:.0f}bpm"
+            else:
+                chosen_sig, chosen_peaks = b_sig, b_peaks
+                chosen_path = f"B_fallback_IC{b_idx+1}_{b_hr:.0f}bpm"
+        self._log(f"  Selected: {chosen_path} ({len(chosen_peaks)} peaks)")
+
+        # Step 9b: Ensemble vote — CinC only, where single-path reliability is low
+        dataset = recording.get("dataset", "ADFECGDB")
+        if (dataset.upper() == "CINC2013" and a_valid and b_valid 
+                and abs(a_n - b_n) < 0.3 * max(a_n, b_n)):
+            merged = _ensemble_peaks(a_peaks, b_peaks, fs, cfg)
+            if len(merged) >= min_peaks:
+                chosen_sig = a_sig
+                chosen_peaks = merged
+                chosen_path = f"ENSEMBLE_A{a_idx+1}_B{b_idx+1}"
+
+        # Use the selected fetal IC directly (disable EKF and beyond)
+        fetal_ecg = chosen_sig
+        fetal_ic_raw = chosen_sig
+        fetal_peaks = chosen_peaks
+        fetal_peaks = _recover_missed_beats(fetal_ecg, fetal_peaks, fs, cfg)
+
+        # Step 12: Evaluation
+        self._log("Step 12: Evaluation...")
         if ann_path and ann_is_fetal:
             ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
             self._log(f"  Reference: .{ann_ext} annotation — {len(ref_peaks)} peaks")
@@ -434,14 +474,33 @@ class PHASEPipeline:
             self._log("  Reference: none available")
         metrics = evaluate(
                 fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
-                label=f"PHASE-preview ({rec_id})",
-                tolerance_ms=cfg.EVAL_TOLERANCE_MS
+                label=f"PHASE ({rec_id})",
+                tolerance_ms=cfg.EVAL_TOLERANCE_MS   # pass from config
             )
-        self._log(f"  Metrics: F1={metrics['F1']:.4f}, Se={metrics['Se']:.4f}, PPV={metrics['PPV']:.4f}")
+
+        # Step 13: ECHO XAI -- simplified (only summary stats)
+        self._log("Step 13: ECHO XAI...")
+        has_ref  = dir_proc is not None
+        echo_ref = dir_proc if has_ref else None
+        echo = ECHOExplainer(
+            fs=fs, maternal_peaks=maternal_peaks,
+            fetal_peaks=fetal_peaks, fetal_signal=fetal_ecg,
+            reference_signal=echo_ref, has_reference=has_ref)
+        attribution = echo.compute_attributions()
+        echo_summary = echo.generate_summary_stats(attribution)
+        print(echo_summary)
+        # Skip clinical report for brevity
+
+        if save_figures:
+            self._save_figures(
+                recording, abd_proc, maternal_recon, residual,
+                fetal_ecg, fetal_ic_raw, dir_proc,
+                fetal_peaks, ref_peaks, echo, figures_dir, rec_id)        
 
         return {
             "recording"     : rec_id,
             "fetal_ecg"     : fetal_ecg,
+            "fetal_ecg_pre" : fetal_ic_raw,
             "fetal_peaks"   : fetal_peaks,
             "maternal_peaks": maternal_peaks,
             "ref_peaks"     : ref_peaks,
@@ -451,6 +510,10 @@ class PHASEPipeline:
             "dir_proc"      : dir_proc,
             "weights"       : weights,
             "metrics"       : metrics,
+            "echo"          : echo,
+            "attribution"   : attribution,
+            "echo_summary"  : echo_summary,
+            "chosen_path"   : chosen_path,
         }
 
     def run_with_ablation(self, recording):

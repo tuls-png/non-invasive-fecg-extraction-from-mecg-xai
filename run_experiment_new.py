@@ -74,7 +74,10 @@ def run_full_dataset(dataset_name: str, data_dir: str, save_figures: bool = True
                 save_figures=save_figures,
                 figures_dir=f"figures_{dataset_name}"
             )
-            logger.log_recording(rec["recording"], f"PHASE_{dataset_name}", result["metrics"])
+            # Add ECHO summary to metrics for logging
+            metrics_with_echo = result["metrics"].copy()
+            metrics_with_echo["echo_summary"] = result["echo_summary"]
+            logger.log_recording(rec["recording"], f"PHASE_{dataset_name}", metrics_with_echo)
             all_metrics.append(result["metrics"])
         except Exception as e:
             print(f"[ERROR] {rec['recording']}: {e}")
@@ -179,10 +182,20 @@ def run_single_recording(dataset_name: str, filepath: str):
     pipe = PHASEPipeline(verbose=True, dataset=dataset_name)
     result = pipe.run(rec, save_figures=True, figures_dir="figures")
 
+    # Log results for single recording
+    logger = ResultsLogger("results_single")
+    metrics_with_echo = result["metrics"].copy()
+    metrics_with_echo["echo_summary"] = result["echo_summary"]
+    logger.log_recording(rec["recording"], f"PHASE_{dataset_name}", metrics_with_echo)
+    logger.save()
+
     print("\nFinal Metrics:")
     for k, v in result["metrics"].items():
         if isinstance(v, float):
             print(f"  {k:<20}: {v:.4f}")
+
+    print("\nECHO Summary:")
+    print(result["echo_summary"])
 
     # Show attribution heatmap if ECHO is available
     if hasattr(result.get("echo"), "plot_attribution_heatmap"):
