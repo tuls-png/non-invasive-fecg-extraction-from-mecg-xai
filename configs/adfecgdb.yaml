@@ -15,3 +15,8 @@ fetal_hr_low: 100
 fetal_hr_high: 185
 fetal_hr_centre: 130
 ekf_fetal_hr_init: 150
+wsvd_component_corr_thresh: 0.20   # was 0.30 — accept weaker maternal correlations
+wsvd_channel_r2_min: 0.25          # was 0.35 — subtract from more channels
+wsvd_max_energy_removal: 0.70      # was 0.70 — allow more maternal removal
+maternal_ica2_corr_thresh: 0.25    # was 0.30 — exclude more maternal residual ICs in Path B
+template_half_window_sec: 0.25

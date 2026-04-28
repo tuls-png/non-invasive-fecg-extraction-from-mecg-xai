@@ -17,12 +17,13 @@ fetal_hr_high: 200
 fetal_hr_centre: 130
 ekf_fetal_hr_init: 140
 
-# FIX 2: Lower WSVD thresholds to trigger cancellation on high-maternal-SNR recordings
-wsvd_component_corr_thresh: 0.15
-wsvd_channel_r2_min: 0.20
-
-# FIX 4: Change BANDPASS_LOW to 5.0 Hz to match ADFECGDB (avoid baseline drift)
-bandpass_low: 5.0
-
-# FIX 6: Lower PT_THRESHOLD_FACTOR to recover weak fetal beats post-subtraction
-pt_threshold_factor: 0.5
+wsvd_component_corr_thresh: 0.12   # lower from 0.15 — CinC has weak maternal
+wsvd_channel_r2_min: 0.15          # lower from 0.20
+pt_threshold_factor: 0.40          # lower from 0.50 — recover weak fetal beats
+bandpass_low: 3.0                  # lower from 5.0 — CinC has more baseline drift issues
+# New
+hr_sep_min_bpm: 10                 # relax from 15 — CinC has closer maternal/fetal HRs
+path_a_preference: 1.2             # lower from 1.5 — trust Path B more for CinC
+maternal_ica2_corr_thresh: 0.20    # lower from 0.30 — CinC ICA2 is noisier
+wsvd_max_energy_removal: 0.90      # higher — allow more subtraction on high-maternal recordings
+template_half_window_sec: 0.20

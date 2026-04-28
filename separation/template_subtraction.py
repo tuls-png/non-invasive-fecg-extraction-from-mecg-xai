@@ -158,7 +158,7 @@ def adaptive_template_subtraction(abd_signals: np.ndarray,
 
         # Scale factor: how much to scale template to match current beat
         scale = signal_power / (template_power + 1e-10)  # (n_channels,)
-        scale = np.clip(scale, 0.3, 3.0)                 # prevent extreme scaling
+        scale = np.clip(scale, 0.5, 1.5)                 # prevent extreme scaling
 
         # Subtract scaled template
         scaled_template       = template * scale[:, np.newaxis]

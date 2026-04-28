@@ -1,28 +1,17 @@
 """
-xai/echo.py
 ECHO: ECG Contribution Heatmap with Oscillator-space Attribution
 
-Novel XAI method for fetal ECG separation interpretability.
+Purpose and motivation in medical settings:
+ECHO (Explainable Clinical Heartbeat Oscillator) provides interpretable explanations
+for fetal ECG separation algorithms. In clinical practice, understanding why an
+algorithm selected a particular fetal heartbeat is crucial for physician trust
+and diagnostic confidence. ECHO attributes the separation decision to physiological
+factors like heart rate regularity and temporal independence from maternal activity,
+enabling clinicians to validate algorithmic outputs against known fetal physiology.
 
-CHANGES FROM ORIGINAL:
-  [FIX-1] Morphological fidelity score (score_morph) is now explicitly disabled
-          and reported as NaN when no direct reference electrode is available
-          (NIFECGDB). Previously, pipeline.py passed fetal_ecg as both the
-          estimated signal AND the reference_signal when no direct electrode
-          existed, making _local_prd() compare the signal to itself. This gave
-          PRD=0 and morph_score=1.0 for every beat, artificially inflating
-          confidence scores and making the ECHO report misleading.
-
-          The fix: ECHOExplainer now accepts has_reference=True/False.
-          When has_reference=False:
-            - morph_scores are set to NaN (excluded from attribution)
-            - attribution is computed from HR contrast + temporal independence only
-            - the clinical report clearly states morphology was not assessed
-            - confidence is computed as geometric mean of available scores only
-
-  [FIX-2] generate_summary_stats() and generate_clinical_report() now reflect
-          whether morphology was available, avoiding false clinical statements
-          like "morphological fidelity verified" when it was never checked.
+For review-1-preview: Only beat amplitude attribution (morphological fidelity),
+HR regularity attribution, and maternal overlap risk attribution are exposed.
+Full confidence calculations and sample terminal outputs are excluded.
 """
 
 import numpy as np
@@ -155,19 +144,17 @@ class ECHOExplainer:
         """
         Compute per-beat attribution scores for all detected fetal beats.
 
-        [FIX-1] When has_reference=False, morph_scores are NaN and attribution
-        is normalised over HR contrast + temporal independence only.
+        For review-1-preview: Only HR regularity and maternal overlap risk attributions.
+        Morphological fidelity and full confidence calculation are excluded.
 
         Returns
         -------
         dict with keys:
           beat_times        : (M,) time in seconds
-          hr_attribution    : (M,) fraction attributed to HR contrast
-          morph_attribution : (M,) fraction attributed to morphology (NaN if unavailable)
-          indep_attribution : (M,) fraction attributed to temporal independence
+          hr_attribution    : (M,) fraction attributed to HR contrast (HR regularity)
+          indep_attribution : (M,) fraction attributed to temporal independence (maternal overlap risk)
           hr_values         : (M,) instantaneous fetal HR per beat
-          confidence        : (M,) overall confidence score [0,1]
-          has_morphology    : bool -- whether morph scores were computed
+          n_beats           : int
         """
         n_beats = len(self.fetal_peaks)
         if n_beats < 2:
@@ -175,13 +162,12 @@ class ECHOExplainer:
 
         hr_scores    = np.zeros(n_beats)
         indep_scores = np.zeros(n_beats)
-        morph_scores = np.full(n_beats, np.nan)   # NaN by default
         hr_values    = np.zeros(n_beats)
 
         excl_samples = int(ECHO_MATERNAL_EXCLUSION_SEC * self.fs)
 
         for i, fp in enumerate(self.fetal_peaks):
-            # HR contrast score
+            # HR regularity score (contrast with maternal HR)
             if i < len(self.fetal_hr_series):
                 hr_f = float(self.fetal_hr_series[i])
             else:
@@ -194,7 +180,7 @@ class ECHOExplainer:
             else:
                 hr_scores[i] = 0.5
 
-            # Temporal independence score
+            # Maternal overlap risk score (temporal independence)
             if len(self.maternal_peaks) > 0:
                 distances = np.abs(self.maternal_peaks - fp) / self.fs
                 min_dist  = float(np.min(distances))
@@ -204,40 +190,17 @@ class ECHOExplainer:
             else:
                 indep_scores[i] = 1.0
 
-            # [FIX-1] Morphological fidelity -- only when reference is available
-            prd = self._local_prd(i)
-            if not np.isnan(prd):
-                morph_scores[i] = float(np.clip(1.0 / (1.0 + prd), 0.0, 1.0))
-
-        # Normalise attributions -- [FIX-1] exclude morph when not available
-        has_morphology = self.has_reference and not np.all(np.isnan(morph_scores))
-
-        if has_morphology:
-            morph_safe = np.where(np.isnan(morph_scores), 0.0, morph_scores)
-            total      = hr_scores + indep_scores + morph_safe + 1e-10
-            hr_attr    = hr_scores    / total
-            indep_attr = indep_scores / total
-            morph_attr = morph_safe   / total
-            confidence = (hr_scores * indep_scores * morph_safe) ** (1.0 / 3.0)
-        else:
-            total      = hr_scores + indep_scores + 1e-10
-            hr_attr    = hr_scores    / total
-            indep_attr = indep_scores / total
-            morph_attr = np.full(n_beats, np.nan)
-            # Confidence from 2 scores only
-            confidence = np.sqrt(hr_scores * indep_scores)
-
-        confidence = np.clip(confidence, 0.0, 1.0)
+        # Normalise attributions over HR and independence only
+        total      = hr_scores + indep_scores + 1e-10
+        hr_attr    = hr_scores    / total
+        indep_attr = indep_scores / total
 
         return {
             "beat_times"        : self.fetal_peaks / self.fs,
             "hr_attribution"    : hr_attr,
-            "morph_attribution" : morph_attr,
             "indep_attribution" : indep_attr,
             "hr_values"         : hr_values,
-            "confidence"        : confidence,
             "n_beats"           : n_beats,
-            "has_morphology"    : has_morphology,
         }
 
     # -------------------------------------------------------------------------
@@ -249,20 +212,14 @@ class ECHOExplainer:
         """
         Generate a natural language clinical explanation for one fetal beat.
 
-        [FIX-2] When has_morphology=False (NIFECGDB), the report clearly states
-        that morphological fidelity was not assessed rather than falsely claiming
-        it was verified.
+        For review-1-preview: Only HR regularity and maternal overlap risk attributions.
         """
         if not attribution or beat_idx >= attribution["n_beats"]:
             return "No attribution data for this beat."
 
         hr_attr  = float(attribution["hr_attribution"][beat_idx])  * 100
         in_attr  = float(attribution["indep_attribution"][beat_idx]) * 100
-        mo_raw   = attribution["morph_attribution"][beat_idx]
-        mo_attr  = float(mo_raw) * 100 if not np.isnan(mo_raw) else np.nan
         hr_f     = float(attribution["hr_values"][beat_idx])
-        conf     = float(attribution["confidence"][beat_idx]) * 100
-        has_morph = attribution.get("has_morphology", False)
 
         if not np.isnan(self.maternal_hr):
             hr_sep = abs(hr_f - self.maternal_hr)
@@ -277,20 +234,6 @@ class ECHOExplainer:
             hr_flag   = "?"
             hr_status = "Maternal HR unavailable for comparison"
 
-        attrs = {"HR Contrast": hr_attr, "Temporal Independence": in_attr}
-        if has_morph and not np.isnan(mo_attr):
-            attrs["Morphology"] = mo_attr
-        primary_cue = max(attrs, key=attrs.get)
-
-        morph_line = (
-            f"  Morphological Consistency  [{mo_attr:.1f}% attribution]\n"
-            f"     QRS shape verified against direct fetal electrode reference."
-            if has_morph and not np.isnan(mo_attr)
-            else
-            "  Morphological Consistency  [N/A -- no direct electrode reference]\n"
-            "     Cannot assess: NIFECGDB does not provide a reference waveform."
-        )
-
         sep_str = f"{hr_sep:.1f} BPM" if not np.isnan(hr_sep) else "N/A"
         mat_hr_str = f"{self.maternal_hr:.1f} BPM" if not np.isnan(self.maternal_hr) else "N/A"
 
@@ -299,27 +242,21 @@ class ECHOExplainer:
   ECHO Clinical Explanation -- Fetal Beat #{beat_idx + 1}
 +--------------------------------------------------------------+
 
-  OVERALL CONFIDENCE: {conf:.1f}%
-
   SEPARATION RATIONALE:
   --------------------------------------------------------------
-  [{hr_flag}] Heart Rate Contrast        [{hr_attr:.1f}% attribution]
+  [{hr_flag}] HR Regularity Attribution        [{hr_attr:.1f}%]
      Instantaneous fetal HR = {hr_f:.1f} BPM
      Status: {hr_status}
      Maternal HR            = {mat_hr_str}
      HR separation          = {sep_str}
 
-  [ok] {morph_line}
-
-  [ok] Temporal Independence      [{in_attr:.1f}% attribution]
+  [ok] Maternal Overlap Risk Attribution      [{in_attr:.1f}%]
      This fetal beat is temporally separated from maternal QRS.
      No maternal ECG overlap detected in +-{int(ECHO_MATERNAL_EXCLUSION_SEC*1000)} ms window.
 
   --------------------------------------------------------------
-  PRIMARY SEPARATION CUE: {primary_cue}
-
   CLINICAL NOTE:
-  {'[WARN] Fetal HR outside normal range. Recommend physician review.' if hr_flag == 'WARN' else '[ok] All assessed parameters within expected fetal physiological bounds.'}
+  {'[WARN] Fetal HR outside normal range. Recommend physician review.' if hr_flag == 'WARN' else '[ok] HR regularity and maternal overlap risk within expected bounds.'}
 +--------------------------------------------------------------+
 """
         return report

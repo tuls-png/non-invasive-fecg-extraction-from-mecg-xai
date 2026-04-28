@@ -39,6 +39,7 @@ from separation.ekf import FetalECGKalmanFilter
 from evaluation.metrics import evaluate
 from xai.echo import ECHOExplainer
 from preprocessing.qrs_detector import load_wfdb_annotation
+from separation.template_subtraction import extract_maternal_template, adaptive_template_subtraction, verify_cancellation
 
 
 def _min_usable_peaks(duration_sec: float, cfg, dataset: str = "ADFECGDB") -> int:
@@ -47,7 +48,8 @@ def _min_usable_peaks(duration_sec: float, cfg, dataset: str = "ADFECGDB") -> in
         return max(20, int(expected * 0.15))
     else:
         expected = duration_sec * cfg.FETAL_HR_LOW / 60.0
-        return max(30, int(expected * 0.5))
+        # return max(30, int(expected * 0.5))
+        return max(20, int(expected * 0.35))
 
 
 def _norm(sig):
@@ -148,7 +150,8 @@ def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
     valid = [c for c in candidates
              if c["passes_hr"] and c["n_peaks"] >= min_peaks]
     if valid:
-        best = max(valid, key=lambda c: c["n_peaks"] * c["hr_score"])
+        # best = max(valid, key=lambda c: c["n_peaks"] * c["hr_score"])
+        best = max(valid, key=lambda c: (c["n_peaks"] ** 1.5) * c["hr_score"])
         return best["sig"], best["idx"], best["peaks"], best["mean_hr"]
 
     if label:
@@ -182,9 +185,76 @@ def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts, cfg=None):
     out = (ekf.smooth(fetal_ic, detected_peaks=fetal_peaks) if use_rts
            else ekf.filter(fetal_ic, detected_peaks=fetal_peaks)[0])
     peaks_post = detect_fetal_qrs(out, fs, cfg=cfg)
-    if len(peaks_post) < max(10, len(fetal_peaks) * 0.3):
+
+    # CinC is noisy — EKF more likely to diverge, use stricter guard
+    dataset = getattr(cfg, 'dataset', 'adfecgdb').lower()
+    min_fraction = 0.50 if dataset == 'cinc2013' else 0.30
+
+    if len(peaks_post) < max(10, len(fetal_peaks) * min_fraction):
         return fetal_ic
     return out
+
+def _recover_missed_beats(sig, peaks, fs, cfg, max_gap_factor=1.75):
+    """Insert candidate peaks where RR gap > 1.75x median RR (likely missed beat)."""
+    if len(peaks) < 4:
+        return peaks
+    rr = np.diff(peaks)
+    median_rr = np.median(rr)
+    new_peaks = list(peaks)
+    for i, gap in enumerate(rr):
+        if gap > max_gap_factor * median_rr:
+            n_missing = round(gap / median_rr) - 1
+            for k in range(1, n_missing + 1):
+                candidate = int(peaks[i] + k * gap / (n_missing + 1))
+                lo = max(0, candidate - int(0.08 * fs))
+                hi = min(len(sig), candidate + int(0.08 * fs))
+                if hi > lo:
+                    median_fetal_amp = np.median(np.abs(sig[peaks]))
+                    candidate_idx = lo + int(np.argmax(np.abs(sig[lo:hi])))
+                    candidate_amp = np.abs(sig[candidate_idx])
+                    if candidate_amp >= 0.35 * median_fetal_amp:  # must be at least 35% of median
+                        new_peaks.append(candidate_idx)
+    new_peaks = np.array(sorted(set(new_peaks)))
+    # Validate recovered peaks are in fetal HR range
+    rr_new = np.diff(new_peaks) / fs
+    hr_new = 60.0 / (rr_new + 1e-8)
+    valid_mask = np.concatenate([[True], (cfg.FETAL_HR_LOW <= hr_new) & (hr_new <= cfg.FETAL_HR_HIGH)])
+    return new_peaks[valid_mask]
+
+def _ensemble_peaks(peaks_a, peaks_b, fs, cfg, tol_ms=50):
+    """Keep peaks that appear in both detectors within tolerance."""
+    tol = int(tol_ms * fs / 1000)
+    consensus = []
+    for p in peaks_a:
+        if len(peaks_b) > 0 and np.min(np.abs(peaks_b - p)) <= tol:
+            # Average the two detections
+            closest_b = peaks_b[np.argmin(np.abs(peaks_b - p))]
+            consensus.append((p + closest_b) // 2)
+    return np.array(sorted(consensus))
+
+def _hr_consistency_score(peaks, fs, cfg=None, expected_fhr=None):
+    if len(peaks) < 5:
+        return 0.0
+
+    hr_low  = getattr(cfg, 'FETAL_HR_LOW',  100) if cfg else 100
+    hr_high = getattr(cfg, 'FETAL_HR_HIGH', 185) if cfg else 185
+
+    rr = np.diff(peaks) / fs * 1000
+    hr = 60000.0 / (rr + 1e-8)
+
+    in_range    = np.mean((hr >= hr_low) & (hr <= hr_high))
+    cv          = np.std(rr) / (np.mean(rr) + 1e-8)
+    stability   = np.exp(-cv)
+
+    if expected_fhr is not None and len(peaks) > 1:
+        duration   = (peaks[-1] - peaks[0]) / fs
+        expected_n = int(expected_fhr / 60.0 * duration)
+        count_score = min(len(peaks), expected_n) / max(len(peaks), expected_n, 1)
+    else:
+        count_score = min(1.0, len(peaks) / 100.0)
+
+    return in_range * 0.5 + stability * 0.3 + count_score * 0.2
+
 
 class PHASEPipeline:
     def __init__(self, fs=None, use_rts=True, ekf_bypass=False, verbose=True,
@@ -225,6 +295,17 @@ class PHASEPipeline:
         maternal_ic_idx, _ = select_maternal_ic(ICs1, fs)
         maternal_ic        = get_ic_as_signal(ICs1, maternal_ic_idx)
 
+        # Add temporarily after Step 2 for a13 debugging
+        for i in range(ICs1.shape[0]):
+            if i == maternal_ic_idx:
+                continue
+            sig = get_ic_as_signal(ICs1, i)
+            pks = detect_fetal_qrs(sig, fs, cfg=cfg)
+            print(f"IC{i+1} raw peaks: {len(pks)}, signal std: {np.std(sig):.4f}")
+            if len(pks) > 5:
+                rr = np.diff(pks)/fs*1000
+                print(f"  RR mean={np.mean(rr):.0f}ms, std={np.std(rr):.0f}ms, HR={60000/np.mean(rr):.1f}bpm")
+
         # Step 3: Maternal QRS
         self._log("Step 3: Maternal QRS detection...")
         maternal_peaks = detect_maternal_qrs(maternal_ic, fs)
@@ -249,90 +330,99 @@ class PHASEPipeline:
             self._log("  Annotation skipped (not fetal ground truth)")
 
         # Step 4: Path A
-        self._log("Step 4: Path A -- ICA1 direct (HR-aware scan)...")
+        self._log("Step 4: Path A -- ICA1 direct (HR-aware scan)...")        
         a_sig, a_idx, a_peaks, a_hr = _best_ic(
             ICs1, maternal_ic_idx, maternal_hr, fs, cfg,
-            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks)
+            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks)        
         a_n     = len(a_peaks)
         a_valid = _is_fetal_hr(a_hr, maternal_hr, cfg)
         self._log(f"  Path A: IC{a_idx+1}, {a_n} peaks, "
                   f"HR={a_hr:.1f} BPM, valid={'YES' if a_valid else 'NO'}")
+        
+        # Save best raw ICA candidates before any subtraction
+        raw_ic_candidates = []
+        for ic_idx in range(ICs1.shape[0]):
+            if ic_idx == maternal_ic_idx:
+                continue
+            sig = get_ic_as_signal(ICs1, ic_idx)
+            pks = detect_fetal_qrs(sig, fs, cfg=cfg)
+            if len(pks) < min_peaks:
+                continue
+            hr  = compute_hr_stats(pks, fs)["mean_hr"]
+            if _is_fetal_hr(hr, maternal_hr, cfg):
+                raw_ic_candidates.append((sig, pks, hr, ic_idx))
 
-        # Step 5: Gaussian weights
-        self._log("Step 5: Gaussian weight matrix...")
-        weights = gaussian_weight_matrix(abd_proc.shape[1], maternal_peaks, fs)
+        if raw_ic_candidates and expected_fhr:
+            best_raw = min(raw_ic_candidates,
+                        key=lambda x: abs(x[2] - expected_fhr))
+        elif raw_ic_candidates:
+            best_raw = max(raw_ic_candidates, key=lambda x: len(x[1]))
+        else:
+            best_raw = (a_sig, a_peaks, a_hr, a_idx)
 
-        # Step 6: AW-WSVD
-        self._log("Step 6: AW-WSVD maternal reconstruction...")
-        svd_explained_variance(abd_proc)
+        best_ic_signal_raw  = best_raw[0]
+        fetal_peaks_ica_raw = best_raw[1]
+        self._log(f"  Raw ICA baseline: IC{best_raw[3]+1}, {len(fetal_peaks_ica_raw)} peaks, HR={best_raw[2]:.1f} BPM")
+
+        # # Step 5: Gaussian weights
+        # self._log("Step 5: Gaussian weight matrix...")
+        # weights = gaussian_weight_matrix(abd_proc.shape[1], maternal_peaks, fs)
+
+        # # Step 6: AW-WSVD
+        # self._log("Step 6: AW-WSVD maternal reconstruction...")
+        # svd_explained_variance(abd_proc)
+        # channel_r2 = np.array([
+        #     float(np.corrcoef(abd_proc[ch], maternal_ic)[0, 1] ** 2)
+        #     for ch in range(abd_proc.shape[0])
+        # ])
+        # maternal_recon = adaptive_windowed_wsvd(
+        #     abd_proc, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2)
+
+        # # Step 7: Maternal cancellation
+        # self._log("Step 7: Maternal cancellation...")
+        # residual = subtract_maternal(abd_proc, maternal_recon)
+
+        # Step 6: Adaptive Template Subtraction (primary cancellation)
+        maternal_template = extract_maternal_template(abd_proc, maternal_peaks, fs)
+        hw_sec = getattr(cfg, 'TEMPLATE_HALF_WINDOW_SEC', 0.25)
+        residual_ts = adaptive_template_subtraction(abd_proc, maternal_peaks, fs, half_window_sec=hw_sec)
+        cancellation = verify_cancellation(abd_proc, residual_ts, maternal_peaks, fs, half_window_sec=0.15)
+
+        # Only use template residual if it actually reduced maternal energy
+        # If cancellation_db < 3dB, template subtraction hurt more than helped — skip it
+        if cancellation['cancellation_db'] >= 3.0:
+            self._log(f"  Template subtraction: {cancellation['cancellation_db']:.1f} dB reduction — using residual")
+            ts_input = residual_ts
+        else:
+            self._log(f"  Template subtraction: only {cancellation['cancellation_db']:.1f} dB — skipping, using original")
+            ts_input = abd_proc
+
+        # Step 7: AW-WSVD on whichever input passed the gate
+        weights = gaussian_weight_matrix(ts_input.shape[1], maternal_peaks, fs)
         channel_r2 = np.array([
-            float(np.corrcoef(abd_proc[ch], maternal_ic)[0, 1] ** 2)
-            for ch in range(abd_proc.shape[0])
+            float(np.corrcoef(ts_input[ch], maternal_ic)[0, 1] ** 2)
+            for ch in range(ts_input.shape[0])
         ])
         maternal_recon = adaptive_windowed_wsvd(
-            abd_proc, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2)
+            ts_input, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2)
+        residual = subtract_maternal(ts_input, maternal_recon)
 
-        # Step 7: Maternal cancellation
-        self._log("Step 7: Maternal cancellation...")
-        residual = subtract_maternal(abd_proc, maternal_recon)
-
-        # Step 8: Path B -- ICA2 with [FIX-1] maternal residual exclusion
-        self._log("Step 8: Path B -- ICA2 on residual (HR-aware scan)...")
+        # Step 7: ICA2 on residual
+        self._log("Step 7: ICA2 on residual...")
         ICs2, _          = run_ica(residual, n_components=cfg.ICA_N_COMPONENTS)
         mat_residual_idx = _find_maternal_residual_idx(ICs2, maternal_ic, cfg)
         b_sig, b_idx, b_peaks, b_hr = _best_ic(
             ICs2, mat_residual_idx, maternal_hr, fs, cfg,
-            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks)
+            label="ICA2", expected_hr=expected_fhr, min_peaks=min_peaks)
         b_n     = len(b_peaks)
         b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
-        self._log(f"  Path B: IC{b_idx+1}, {b_n} peaks, "
+        self._log(f"  ICA2: IC{b_idx+1}, {b_n} peaks, "
                   f"HR={b_hr:.1f} BPM, valid={'YES' if b_valid else 'NO'}")
 
-        # Step 9: Select best path
-        self._log("Step 9: Selecting best path...")
-        if a_valid and b_valid:
-            if a_n >= b_n * cfg.PATH_A_PREFERENCE:
-                chosen_sig, chosen_peaks = a_sig, a_peaks
-                chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
-            else:
-                chosen_sig, chosen_peaks = b_sig, b_peaks
-                chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
-        elif a_valid:
-            chosen_sig, chosen_peaks = a_sig, a_peaks
-            chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
-        elif b_valid:
-            chosen_sig, chosen_peaks = b_sig, b_peaks
-            chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
-        else:
-            a_score = _hr_score(a_hr)
-            b_score = _hr_score(b_hr)
-            if a_score >= b_score:
-                chosen_sig, chosen_peaks = a_sig, a_peaks
-                chosen_path = f"A_fallback_IC{a_idx+1}_{a_hr:.0f}bpm"
-            else:
-                chosen_sig, chosen_peaks = b_sig, b_peaks
-                chosen_path = f"B_fallback_IC{b_idx+1}_{b_hr:.0f}bpm"
-        self._log(f"  Selected: {chosen_path} ({len(chosen_peaks)} peaks)")
-
-        # Step 10: EKF-RTS
-        self._log("Step 10: EKF-RTS morphological refinement...")
-        fetal_ic_raw = chosen_sig
-        if self.ekf_bypass:
-            fetal_ecg = fetal_ic_raw
-            self._log("  EKF bypassed")
-        else:
-            fetal_ecg = _apply_ekf(fetal_ic_raw, chosen_peaks, fs, self.use_rts, cfg=cfg)
-            n_post = len(detect_fetal_qrs(fetal_ecg, fs, cfg=cfg))
-            self._log(f"  EKF complete -- {n_post} peaks post-EKF (was {len(chosen_peaks)})")
-
-        # Step 11: Final QRS
-        self._log("Step 11: Final fetal QRS detection...")
-        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
-        fet_hr = compute_hr_stats(fetal_peaks, fs)
-        self._log(f"  {len(fetal_peaks)} peaks, HR = {fet_hr['mean_hr']:.1f} BPM")
-
-        # Step 12: Evaluation
-        self._log("Step 12: Evaluation...")
+        # Evaluation for steps 1-7
+        self._log("Evaluation for steps 1-7...")
+        fetal_ecg = b_sig
+        fetal_peaks = b_peaks
         if ann_path and ann_is_fetal:
             ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
             self._log(f"  Reference: .{ann_ext} annotation — {len(ref_peaks)} peaks")
@@ -344,33 +434,14 @@ class PHASEPipeline:
             self._log("  Reference: none available")
         metrics = evaluate(
                 fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
-                label=f"PHASE ({rec_id})",
-                tolerance_ms=cfg.EVAL_TOLERANCE_MS   # pass from config
+                label=f"PHASE-preview ({rec_id})",
+                tolerance_ms=cfg.EVAL_TOLERANCE_MS
             )
-
-        # Step 13: ECHO XAI -- [FIX-3] explicit has_reference flag
-        self._log("Step 13: ECHO XAI...")
-        has_ref  = dir_proc is not None
-        echo_ref = dir_proc if has_ref else None
-        echo = ECHOExplainer(
-            fs=fs, maternal_peaks=maternal_peaks,
-            fetal_peaks=fetal_peaks, fetal_signal=fetal_ecg,
-            reference_signal=echo_ref, has_reference=has_ref)
-        attribution = echo.compute_attributions()
-        print(echo.generate_summary_stats(attribution))
-        if attribution and attribution["n_beats"] > 0:
-            print(echo.generate_clinical_report(0, attribution))
-
-        if save_figures:
-            self._save_figures(
-                recording, abd_proc, maternal_recon, residual,
-                fetal_ecg, fetal_ic_raw, dir_proc,
-                fetal_peaks, ref_peaks, echo, figures_dir, rec_id)
+        self._log(f"  Metrics: F1={metrics['F1']:.4f}, Se={metrics['Se']:.4f}, PPV={metrics['PPV']:.4f}")
 
         return {
             "recording"     : rec_id,
             "fetal_ecg"     : fetal_ecg,
-            "fetal_ecg_pre" : fetal_ic_raw,
             "fetal_peaks"   : fetal_peaks,
             "maternal_peaks": maternal_peaks,
             "ref_peaks"     : ref_peaks,
@@ -380,9 +451,6 @@ class PHASEPipeline:
             "dir_proc"      : dir_proc,
             "weights"       : weights,
             "metrics"       : metrics,
-            "echo"          : echo,
-            "attribution"   : attribution,
-            "chosen_path"   : chosen_path,
         }
 
     def run_with_ablation(self, recording):
