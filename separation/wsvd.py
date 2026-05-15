@@ -64,34 +64,21 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
                             mat_ic: np.ndarray = None,
                             n_components: int = WSVD_N_COMPONENTS,
                             corr_thresh: float = WSVD_COMPONENT_CORR_THRESH,
-                            channel_r2: np.ndarray = None) -> np.ndarray:
+                            channel_r2: np.ndarray = None,
+                            cfg=None) -> np.ndarray:
     """
     Adaptive Windowed WSVD with per-window maternal correlation validation
     and per-channel subtraction gating.
 
-    Per-channel gating: only subtract from channels where maternal IC R^2
-    is above WSVD_CHANNEL_R2_MIN. Channels with low maternal R^2 are
-    fetal-dominant and are left untouched.
-
-    Per-window validation: only SVD components whose reconstructed waveform
-    correlates with the maternal IC above corr_thresh are subtracted.
-    Windows where nothing passes are left unchanged — safer than
-    over-subtraction.
-
-    Parameters
-    ----------
-    abd         : (n_ch, N) preprocessed abdominal signal
-    weights     : (N,) Gaussian weight matrix
-    fs          : sampling rate
-    mat_ic      : (N,) maternal IC for per-window correlation validation
-    n_components: max SVD components to consider per window
-    corr_thresh : minimum |correlation| to accept component as maternal
-    channel_r2  : (n_ch,) maternal IC R^2 per channel
-
-    Returns
-    -------
-    recon : (n_ch, N) reconstructed maternal signal
+    [FIX-CINC] Added cfg parameter so dataset-specific YAML overrides for
+    WSVD_COMPONENT_CORR_THRESH and WSVD_CHANNEL_R2_MIN are actually applied
+    at runtime rather than being silently ignored (module-level globals are
+    initialised from BaseConfig at import time, not from the dataset config).
     """
+    # [FIX-CINC] Use runtime cfg values when supplied; fall back to module globals
+    _corr_thresh   = cfg.WSVD_COMPONENT_CORR_THRESH if cfg is not None else corr_thresh
+    _channel_r2_min = cfg.WSVD_CHANNEL_R2_MIN        if cfg is not None else WSVD_CHANNEL_R2_MIN
+    _max_energy    = cfg.WSVD_MAX_ENERGY_REMOVAL      if cfg is not None else WSVD_MAX_ENERGY_REMOVAL
     n_ch, N = abd.shape
     win_len = int(WSVD_WINDOW_SEC * fs)
     hop     = int(win_len * (1.0 - WSVD_OVERLAP))
@@ -105,10 +92,10 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
 
     # Determine which channels to subtract from
     if channel_r2 is not None:
-        subtract_mask = np.array(channel_r2) >= WSVD_CHANNEL_R2_MIN
+        subtract_mask = np.array(channel_r2) >= _channel_r2_min
         if not subtract_mask.any():
             subtract_mask[:] = True   # fallback: use all channels
-        print(f"[AW-WSVD] Channel subtraction mask (R^2>={WSVD_CHANNEL_R2_MIN}): "
+        print(f"[AW-WSVD] Channel subtraction mask (R^2>={_channel_r2_min}): "
               f"{[f'ch{i+1}:{subtract_mask[i]}(R^2={channel_r2[i]:.3f})' for i in range(n_ch)]}")
     else:
         subtract_mask = np.ones(n_ch, dtype=bool)
@@ -137,7 +124,7 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
                 if len(mat_seg) == len(scalar):
                     try:
                         c = np.corrcoef(scalar, mat_seg)[0, 1]
-                        if np.isfinite(c) and abs(c) >= corr_thresh:
+                        if np.isfinite(c) and abs(c) >= _corr_thresh:
                             keep_mask[k] = True
                     except Exception:
                         pass
@@ -153,7 +140,7 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
             # Energy protection: skip if reconstruction removes too much energy
             orig_energy  = np.sum(abd[:, start:stop] ** 2) + 1e-12
             recon_energy = np.sum(Xrec ** 2)
-            if recon_energy / orig_energy > WSVD_MAX_ENERGY_REMOVAL:
+            if recon_energy / orig_energy > _max_energy:
                 Xrec = np.zeros((n_ch, win_len))
                 skipped_count += 1
             else:
@@ -172,7 +159,7 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
 
     print(f"[AW-WSVD] Processed {win_count} windows "
           f"(window={WSVD_WINDOW_SEC}s, overlap={WSVD_OVERLAP*100:.0f}%, "
-          f"components={n_components}, corr_thresh={corr_thresh})")
+          f"components={n_components}, corr_thresh={_corr_thresh})")
     if skipped_count > 0:
         pct = 100 * skipped_count / (win_count + 1e-8)
         print(f"[AW-WSVD] {skipped_count} windows ({pct:.1f}%) had no "

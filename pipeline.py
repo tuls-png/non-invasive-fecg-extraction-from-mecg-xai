@@ -91,6 +91,37 @@ def _hr_score(mean_hr, cfg, expected_hr=None):
     return 1.0 / (1.0 + abs(mean_hr - centre) / 30.0)
 
 
+def _ic_purity(peaks: np.ndarray, maternal_peaks: np.ndarray,
+               fs: int, exclusion_ms: float = 80.0) -> float:
+    """
+    Fraction of detected peaks that do NOT fall within exclusion_ms of any
+    maternal QRS locus.  A purely fetal IC should score close to 1.0.
+    A maternal harmonic or noise IC whose spurious peaks align with maternal
+    beats will score near 0.0.
+
+    Parameters
+    ----------
+    peaks          : candidate fetal peaks (sample indices)
+    maternal_peaks : maternal QRS peaks (sample indices)
+    fs             : sampling rate
+    exclusion_ms   : half-window around each maternal peak (ms)
+
+    Returns
+    -------
+    purity : float in [0, 1]
+    """
+    if len(peaks) == 0:
+        return 0.0
+    if len(maternal_peaks) == 0:
+        return 1.0
+    excl_samples = exclusion_ms * fs / 1000.0
+    n_clean = sum(
+        1 for p in peaks
+        if np.min(np.abs(maternal_peaks.astype(float) - float(p))) > excl_samples
+    )
+    return n_clean / len(peaks)
+
+
 def _find_maternal_residual_idx(ICs, maternal_ic, cfg):
     """
     [FIX-1] Find ICA2 component most correlated with maternal IC.
@@ -116,8 +147,11 @@ def _find_maternal_residual_idx(ICs, maternal_ic, cfg):
 
 
 def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
-             label="", expected_hr=None, min_peaks=100):
+             label="", expected_hr=None, min_peaks=100,
+             maternal_peaks=None):
     centre     = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
+    if maternal_peaks is None:
+        maternal_peaks = np.array([], dtype=int)
     candidates = []
     for i, ic in enumerate(ICs):
         if i == exclude_idx:
@@ -131,30 +165,50 @@ def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
         n_peaks        = len(peaks)
         passes_hr      = _is_fetal_hr(mean_hr, maternal_hr, cfg)
         hr_sc          = _hr_score(mean_hr, cfg, expected_hr)
+        # [FIX-CINC] Purity: fraction of peaks NOT near a maternal locus.
+        # Computed for all candidates; used to weight and hard-reject.
+        purity = _ic_purity(peaks, maternal_peaks, fs, exclusion_ms=80.0)
+
         candidates.append({
             "idx": i, "sig": sig_norm, "peaks": peaks,
             "n_peaks": n_peaks, "mean_hr": mean_hr,
             "passes_hr": passes_hr, "hr_score": hr_sc,
+            "purity": purity,
         })
         if label:
             ann_note = f" [ann~{centre:.0f}]" if expected_hr is not None else ""
             print(f"[PHASE]   {label} IC{i+1}: {n_peaks} peaks, "
-                  f"HR={mean_hr:.1f} BPM, "
+                  f"HR={mean_hr:.1f} BPM, purity={purity:.2f}, "
                   f"fetal_hr={'YES' if passes_hr else 'NO'}{ann_note}")
 
     if not candidates:
         raise ValueError(f"{label}: no usable IC candidates found")
 
+    # [FIX-CINC] Prefer candidates that pass HR filter AND have purity >= 0.60.
+    # Combined score = n_peaks * hr_score * purity (purity downweights noisy ICs
+    # whose spurious peaks cluster on maternal loci).
+    # Hard-reject ICs with purity < 0.40 only when at least one other candidate
+    # passes (avoids discarding everything on very noisy recordings).
     valid = [c for c in candidates
              if c["passes_hr"] and c["n_peaks"] >= min_peaks]
+
     if valid:
-        best = max(valid, key=lambda c: c["n_peaks"] * c["hr_score"])
+        # Filter by purity >= 0.40 if any candidate qualifies
+        pure_valid = [c for c in valid if c["purity"] >= 0.40]
+        pool = pure_valid if pure_valid else valid
+        best = max(pool, key=lambda c: c["n_peaks"] * c["hr_score"] * max(c["purity"], 0.10))
+        if label:
+            print(f"[PHASE]   {label}: selected IC{best['idx']+1} "
+                  f"(purity={best['purity']:.2f}, HR={best['mean_hr']:.1f})")
         return best["sig"], best["idx"], best["peaks"], best["mean_hr"]
 
     if label:
         print(f"[PHASE]   {label}: no candidate passed HR filter "
-              f"-- using closest to {centre:.0f} BPM")
-    best = max(candidates, key=lambda c: c["hr_score"])
+              f"-- using closest to {centre:.0f} BPM (purity-weighted)")
+    # Fallback: pure candidates first, then all — no hard reject here
+    pure_candidates = [c for c in candidates if c["purity"] >= 0.40]
+    pool = pure_candidates if pure_candidates else candidates
+    best = max(pool, key=lambda c: c["hr_score"] * max(c["purity"], 0.10))
     return best["sig"], best["idx"], best["peaks"], best["mean_hr"]
 
 def _refine_peaks_on_smoothed(smoothed, rough_peaks, fs, search_radius_ms=40.0):
@@ -182,8 +236,24 @@ def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts, cfg=None):
     out = (ekf.smooth(fetal_ic, detected_peaks=fetal_peaks) if use_rts
            else ekf.filter(fetal_ic, detected_peaks=fetal_peaks)[0])
     peaks_post = detect_fetal_qrs(out, fs, cfg=cfg)
+
+    # Peak count guard (existing)
     if len(peaks_post) < max(10, len(fetal_peaks) * 0.3):
+        print("[EKF] Post-EKF peak count collapsed -- reverting to pre-EKF signal")
         return fetal_ic
+
+    # [FIX-CINC] HR sanity guard: if EKF output HR drifts more than 25 BPM
+    # from the pre-EKF estimate, the filter converged onto the wrong morphology.
+    # Revert to pre-EKF signal to avoid silently returning a maternal-locked output.
+    if cfg is not None and len(peaks_post) >= 2:
+        hr_pre  = compute_hr_stats(fetal_peaks, fs)["mean_hr"]
+        hr_post = compute_hr_stats(peaks_post,  fs)["mean_hr"]
+        if not np.isnan(hr_pre) and not np.isnan(hr_post):
+            if abs(hr_post - hr_pre) > 25.0:
+                print(f"[EKF] HR drift {hr_pre:.1f} -> {hr_post:.1f} BPM "
+                      f"(>{25} BPM) -- EKF may have locked to wrong morphology, reverting")
+                return fetal_ic
+
     return out
 
 class PHASEPipeline:
@@ -252,7 +322,8 @@ class PHASEPipeline:
         self._log("Step 4: Path A -- ICA1 direct (HR-aware scan)...")
         a_sig, a_idx, a_peaks, a_hr = _best_ic(
             ICs1, maternal_ic_idx, maternal_hr, fs, cfg,
-            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks)
+            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks,
+            maternal_peaks=maternal_peaks)
         a_n     = len(a_peaks)
         a_valid = _is_fetal_hr(a_hr, maternal_hr, cfg)
         self._log(f"  Path A: IC{a_idx+1}, {a_n} peaks, "
@@ -270,7 +341,8 @@ class PHASEPipeline:
             for ch in range(abd_proc.shape[0])
         ])
         maternal_recon = adaptive_windowed_wsvd(
-            abd_proc, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2)
+            abd_proc, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2,
+            cfg=cfg)
 
         # Step 7: Maternal cancellation
         self._log("Step 7: Maternal cancellation...")
@@ -282,7 +354,8 @@ class PHASEPipeline:
         mat_residual_idx = _find_maternal_residual_idx(ICs2, maternal_ic, cfg)
         b_sig, b_idx, b_peaks, b_hr = _best_ic(
             ICs2, mat_residual_idx, maternal_hr, fs, cfg,
-            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks)
+            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks,
+            maternal_peaks=maternal_peaks)
         b_n     = len(b_peaks)
         b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
         self._log(f"  Path B: IC{b_idx+1}, {b_n} peaks, "
@@ -290,8 +363,22 @@ class PHASEPipeline:
 
         # Step 9: Select best path
         self._log("Step 9: Selecting best path...")
+
+        # [FIX-CINC] Purity-weighted path selection.
+        # Score = n_peaks * purity.  Purity penalises paths whose peaks
+        # cluster near maternal loci -- the dominant failure mode on CinC2013.
+        # PATH_A_PREFERENCE still applies but now acts on the composite score.
+        a_purity = _ic_purity(a_peaks, maternal_peaks, fs, exclusion_ms=80.0)
+        b_purity = _ic_purity(b_peaks, maternal_peaks, fs, exclusion_ms=80.0)
+        a_score  = len(a_peaks) * max(a_purity, 0.10)
+        b_score  = len(b_peaks) * max(b_purity, 0.10)
+        self._log(f"  Path A: {len(a_peaks)} peaks, purity={a_purity:.2f}, "
+                  f"score={a_score:.1f}, valid={'YES' if a_valid else 'NO'}")
+        self._log(f"  Path B: {len(b_peaks)} peaks, purity={b_purity:.2f}, "
+                  f"score={b_score:.1f}, valid={'YES' if b_valid else 'NO'}")
+
         if a_valid and b_valid:
-            if a_n >= b_n * cfg.PATH_A_PREFERENCE:
+            if a_score >= b_score * cfg.PATH_A_PREFERENCE:
                 chosen_sig, chosen_peaks = a_sig, a_peaks
                 chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
             else:
@@ -304,9 +391,10 @@ class PHASEPipeline:
             chosen_sig, chosen_peaks = b_sig, b_peaks
             chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
         else:
-            a_score = _hr_score(a_hr)
-            b_score = _hr_score(b_hr)
-            if a_score >= b_score:
+            # Neither valid: pick by purity-weighted hr_score fallback
+            a_fb = _hr_score(a_hr, cfg, expected_fhr) * max(a_purity, 0.10)
+            b_fb = _hr_score(b_hr, cfg, expected_fhr) * max(b_purity, 0.10)
+            if a_fb >= b_fb:
                 chosen_sig, chosen_peaks = a_sig, a_peaks
                 chosen_path = f"A_fallback_IC{a_idx+1}_{a_hr:.0f}bpm"
             else:

@@ -318,6 +318,50 @@ def detect_fetal_qrs(fetal_signal: np.ndarray, fs: int = FS,
                 keep.append(p)
         best_peaks = np.array(keep)
 
+    # [FIX-TIMING] Polarity-agnostic R-peak refinement.
+    #
+    # Pan-Tompkins integration finds the *energy envelope* peak, which can
+    # land 40-80 ms after the true R-peak (on the S-wave or T-wave shoulder)
+    # when the fetal QRS is low-amplitude and the integration window is wide.
+    # ICA also introduces sign ambiguity: the R-peak may be a trough.
+    #
+    # Fix: for each candidate, search ±REFINE_MS ms on the bandpass-filtered
+    # signal and snap to whichever sample has the largest absolute amplitude.
+    # This is polarity-agnostic and pulls peaks onto the R-peak regardless of
+    # whether the fetal component is positive or negative in the ICA output.
+    #
+    # ADFECGDB is unaffected: its fetal IC (from direct electrode) is clean and
+    # the integration peak already lands on the R-peak; refinement snaps to the
+    # same location. CinC2013 benefits because its weaker, noisier ICA
+    # components have broader integration envelopes with off-R landings.
+    if len(best_peaks) > 0:
+        REFINE_MS = 60.0
+        radius = int(REFINE_MS * fs / 1000.0)
+
+        # Bandpass-filter the signal once for refinement
+        nyq = 0.5 * fs
+        b, a = butter(2, [bandpass_low / nyq, bandpass_high / nyq], btype='band')
+        filt = filtfilt(b, a, fetal_signal)
+
+        refined = []
+        for p in best_peaks:
+            lo = max(0, p - radius)
+            hi = min(len(filt), p + radius + 1)
+            window = filt[lo:hi]
+            # Extremum by absolute value — polarity-agnostic
+            local_off = int(np.argmax(np.abs(window)))
+            refined.append(lo + local_off)
+
+        # Re-apply minimum IBI guard after refinement (snapping can create
+        # duplicates if two candidates were very close)
+        refined = sorted(set(refined))
+        min_ibi = int((60.0 / fetal_hr_max) * fs)
+        deduped = [refined[0]]
+        for p in refined[1:]:
+            if (p - deduped[-1]) >= min_ibi:
+                deduped.append(p)
+        best_peaks = np.array(deduped, dtype=int)
+
     return best_peaks
 
 
