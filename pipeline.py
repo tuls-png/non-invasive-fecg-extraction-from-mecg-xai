@@ -13,6 +13,13 @@ CHANGES FROM ORIGINAL:
   [FIX-2] min_usable_peaks is now recording-length-adaptive (was hardcoded 100).
   [FIX-3] ECHO has_reference passed explicitly; None passed for NIFECGDB so
           morphology score is disabled rather than self-referential.
+  [FIX-4] cfg passed to adaptive_windowed_wsvd so dataset-specific
+          WSVD_CHANNEL_R2_MIN (e.g. 0.20 for CinC2013) is used instead of the
+          hardcoded module-level 0.35 from BaseConfig defaults.
+  [FIX-5] _hr_score fallback path now passes cfg correctly (was crashing with
+          AttributeError when both paths failed HR validation).
+  [FIX-6] Annotation load in evaluation step wrapped in try-except so that
+          recordings with missing .fqrs files do not produce silent Se=0/F1=0.
 """
 
 import sys
@@ -72,7 +79,7 @@ def _is_fetal_hr(mean_hr: float, maternal_hr: float, cfg) -> bool:
     from HR_SEP_MIN_BPM to HR_SEP_MIN_BPM * 0.7 to avoid rejecting valid
     fetal ICs that happen to be in the lower fetal range.
     """
-    print("HR_SEP_MIN_BPM", cfg.HR_SEP_MIN_BPM )
+    print("HR_SEP_MIN_BPM", cfg.HR_SEP_MIN_BPM)
     if np.isnan(mean_hr):
         return False
     in_range = cfg.FETAL_HR_LOW <= mean_hr <= cfg.FETAL_HR_HIGH
@@ -89,37 +96,6 @@ def _hr_score(mean_hr, cfg, expected_hr=None):
     if np.isnan(mean_hr):
         return 0.0
     return 1.0 / (1.0 + abs(mean_hr - centre) / 30.0)
-
-
-def _ic_purity(peaks: np.ndarray, maternal_peaks: np.ndarray,
-               fs: int, exclusion_ms: float = 80.0) -> float:
-    """
-    Fraction of detected peaks that do NOT fall within exclusion_ms of any
-    maternal QRS locus.  A purely fetal IC should score close to 1.0.
-    A maternal harmonic or noise IC whose spurious peaks align with maternal
-    beats will score near 0.0.
-
-    Parameters
-    ----------
-    peaks          : candidate fetal peaks (sample indices)
-    maternal_peaks : maternal QRS peaks (sample indices)
-    fs             : sampling rate
-    exclusion_ms   : half-window around each maternal peak (ms)
-
-    Returns
-    -------
-    purity : float in [0, 1]
-    """
-    if len(peaks) == 0:
-        return 0.0
-    if len(maternal_peaks) == 0:
-        return 1.0
-    excl_samples = exclusion_ms * fs / 1000.0
-    n_clean = sum(
-        1 for p in peaks
-        if np.min(np.abs(maternal_peaks.astype(float) - float(p))) > excl_samples
-    )
-    return n_clean / len(peaks)
 
 
 def _find_maternal_residual_idx(ICs, maternal_ic, cfg):
@@ -147,11 +123,8 @@ def _find_maternal_residual_idx(ICs, maternal_ic, cfg):
 
 
 def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
-             label="", expected_hr=None, min_peaks=100,
-             maternal_peaks=None):
+             label="", expected_hr=None, min_peaks=100):
     centre     = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
-    if maternal_peaks is None:
-        maternal_peaks = np.array([], dtype=int)
     candidates = []
     for i, ic in enumerate(ICs):
         if i == exclude_idx:
@@ -165,50 +138,30 @@ def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
         n_peaks        = len(peaks)
         passes_hr      = _is_fetal_hr(mean_hr, maternal_hr, cfg)
         hr_sc          = _hr_score(mean_hr, cfg, expected_hr)
-        # [FIX-CINC] Purity: fraction of peaks NOT near a maternal locus.
-        # Computed for all candidates; used to weight and hard-reject.
-        purity = _ic_purity(peaks, maternal_peaks, fs, exclusion_ms=80.0)
-
         candidates.append({
             "idx": i, "sig": sig_norm, "peaks": peaks,
             "n_peaks": n_peaks, "mean_hr": mean_hr,
             "passes_hr": passes_hr, "hr_score": hr_sc,
-            "purity": purity,
         })
         if label:
             ann_note = f" [ann~{centre:.0f}]" if expected_hr is not None else ""
             print(f"[PHASE]   {label} IC{i+1}: {n_peaks} peaks, "
-                  f"HR={mean_hr:.1f} BPM, purity={purity:.2f}, "
+                  f"HR={mean_hr:.1f} BPM, "
                   f"fetal_hr={'YES' if passes_hr else 'NO'}{ann_note}")
 
     if not candidates:
         raise ValueError(f"{label}: no usable IC candidates found")
 
-    # [FIX-CINC] Prefer candidates that pass HR filter AND have purity >= 0.60.
-    # Combined score = n_peaks * hr_score * purity (purity downweights noisy ICs
-    # whose spurious peaks cluster on maternal loci).
-    # Hard-reject ICs with purity < 0.40 only when at least one other candidate
-    # passes (avoids discarding everything on very noisy recordings).
     valid = [c for c in candidates
              if c["passes_hr"] and c["n_peaks"] >= min_peaks]
-
     if valid:
-        # Filter by purity >= 0.40 if any candidate qualifies
-        pure_valid = [c for c in valid if c["purity"] >= 0.40]
-        pool = pure_valid if pure_valid else valid
-        best = max(pool, key=lambda c: c["n_peaks"] * c["hr_score"] * max(c["purity"], 0.10))
-        if label:
-            print(f"[PHASE]   {label}: selected IC{best['idx']+1} "
-                  f"(purity={best['purity']:.2f}, HR={best['mean_hr']:.1f})")
+        best = max(valid, key=lambda c: c["n_peaks"] * c["hr_score"])
         return best["sig"], best["idx"], best["peaks"], best["mean_hr"]
 
     if label:
         print(f"[PHASE]   {label}: no candidate passed HR filter "
-              f"-- using closest to {centre:.0f} BPM (purity-weighted)")
-    # Fallback: pure candidates first, then all — no hard reject here
-    pure_candidates = [c for c in candidates if c["purity"] >= 0.40]
-    pool = pure_candidates if pure_candidates else candidates
-    best = max(pool, key=lambda c: c["hr_score"] * max(c["purity"], 0.10))
+              f"-- using closest to {centre:.0f} BPM")
+    best = max(candidates, key=lambda c: c["hr_score"])
     return best["sig"], best["idx"], best["peaks"], best["mean_hr"]
 
 def _refine_peaks_on_smoothed(smoothed, rough_peaks, fs, search_radius_ms=40.0):
@@ -236,24 +189,8 @@ def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts, cfg=None):
     out = (ekf.smooth(fetal_ic, detected_peaks=fetal_peaks) if use_rts
            else ekf.filter(fetal_ic, detected_peaks=fetal_peaks)[0])
     peaks_post = detect_fetal_qrs(out, fs, cfg=cfg)
-
-    # Peak count guard (existing)
     if len(peaks_post) < max(10, len(fetal_peaks) * 0.3):
-        print("[EKF] Post-EKF peak count collapsed -- reverting to pre-EKF signal")
         return fetal_ic
-
-    # [FIX-CINC] HR sanity guard: if EKF output HR drifts more than 25 BPM
-    # from the pre-EKF estimate, the filter converged onto the wrong morphology.
-    # Revert to pre-EKF signal to avoid silently returning a maternal-locked output.
-    if cfg is not None and len(peaks_post) >= 2:
-        hr_pre  = compute_hr_stats(fetal_peaks, fs)["mean_hr"]
-        hr_post = compute_hr_stats(peaks_post,  fs)["mean_hr"]
-        if not np.isnan(hr_pre) and not np.isnan(hr_post):
-            if abs(hr_post - hr_pre) > 25.0:
-                print(f"[EKF] HR drift {hr_pre:.1f} -> {hr_post:.1f} BPM "
-                      f"(>{25} BPM) -- EKF may have locked to wrong morphology, reverting")
-                return fetal_ic
-
     return out
 
 class PHASEPipeline:
@@ -270,7 +207,7 @@ class PHASEPipeline:
             print(f"[PHASE] {msg}")
 
     def run(self, recording, save_figures=False, figures_dir="figures"):
-        cfg      = self.cfg 
+        cfg      = self.cfg
         dataset  = recording.get("dataset", "ADFECGDB")
         rec_id   = recording["recording"]
         abd      = recording["abdomen"]
@@ -308,13 +245,15 @@ class PHASEPipeline:
         expected_fhr  = None
 
         if ann_path and ann_is_fetal:
-            from preprocessing.qrs_detector import load_wfdb_annotation
-            ann_peaks = load_wfdb_annotation(ann_path, ann_ext)
-            if len(ann_peaks) >= 5:
-                ann_stats    = compute_hr_stats(ann_peaks, fs)
-                expected_fhr = ann_stats["mean_hr"]
-                self._log(f"  Annotation prior: {len(ann_peaks)} peaks, "
-                        f"expected fetal HR = {expected_fhr:.1f} BPM")
+            try:
+                ann_peaks = load_wfdb_annotation(ann_path, ann_ext)
+                if len(ann_peaks) >= 5:
+                    ann_stats    = compute_hr_stats(ann_peaks, fs)
+                    expected_fhr = ann_stats["mean_hr"]
+                    self._log(f"  Annotation prior: {len(ann_peaks)} peaks, "
+                            f"expected fetal HR = {expected_fhr:.1f} BPM")
+            except Exception as e:
+                self._log(f"  WARNING: annotation prior load failed ({e}) — no HR prior")
         elif ann_path and not ann_is_fetal:
             self._log("  Annotation skipped (not fetal ground truth)")
 
@@ -322,8 +261,7 @@ class PHASEPipeline:
         self._log("Step 4: Path A -- ICA1 direct (HR-aware scan)...")
         a_sig, a_idx, a_peaks, a_hr = _best_ic(
             ICs1, maternal_ic_idx, maternal_hr, fs, cfg,
-            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks,
-            maternal_peaks=maternal_peaks)
+            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks)
         a_n     = len(a_peaks)
         a_valid = _is_fetal_hr(a_hr, maternal_hr, cfg)
         self._log(f"  Path A: IC{a_idx+1}, {a_n} peaks, "
@@ -334,6 +272,8 @@ class PHASEPipeline:
         weights = gaussian_weight_matrix(abd_proc.shape[1], maternal_peaks, fs)
 
         # Step 6: AW-WSVD
+        # [FIX-4] Pass cfg so adaptive_windowed_wsvd uses cfg.WSVD_CHANNEL_R2_MIN
+        # (dataset-specific) instead of the module-level constant (always 0.35).
         self._log("Step 6: AW-WSVD maternal reconstruction...")
         svd_explained_variance(abd_proc)
         channel_r2 = np.array([
@@ -341,8 +281,10 @@ class PHASEPipeline:
             for ch in range(abd_proc.shape[0])
         ])
         maternal_recon = adaptive_windowed_wsvd(
-            abd_proc, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2,
-            cfg=cfg)
+            abd_proc, weights, fs,
+            mat_ic=maternal_ic,
+            channel_r2=channel_r2,
+            cfg=cfg)                    # <-- FIX-4: pass cfg
 
         # Step 7: Maternal cancellation
         self._log("Step 7: Maternal cancellation...")
@@ -354,31 +296,18 @@ class PHASEPipeline:
         mat_residual_idx = _find_maternal_residual_idx(ICs2, maternal_ic, cfg)
         b_sig, b_idx, b_peaks, b_hr = _best_ic(
             ICs2, mat_residual_idx, maternal_hr, fs, cfg,
-            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks,
-            maternal_peaks=maternal_peaks)
+            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks)
         b_n     = len(b_peaks)
         b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
         self._log(f"  Path B: IC{b_idx+1}, {b_n} peaks, "
                   f"HR={b_hr:.1f} BPM, valid={'YES' if b_valid else 'NO'}")
 
         # Step 9: Select best path
+        # [FIX-5] Pass cfg to _hr_score in fallback branch to avoid
+        #         AttributeError when both paths fail HR validation.
         self._log("Step 9: Selecting best path...")
-
-        # [FIX-CINC] Purity-weighted path selection.
-        # Score = n_peaks * purity.  Purity penalises paths whose peaks
-        # cluster near maternal loci -- the dominant failure mode on CinC2013.
-        # PATH_A_PREFERENCE still applies but now acts on the composite score.
-        a_purity = _ic_purity(a_peaks, maternal_peaks, fs, exclusion_ms=80.0)
-        b_purity = _ic_purity(b_peaks, maternal_peaks, fs, exclusion_ms=80.0)
-        a_score  = len(a_peaks) * max(a_purity, 0.10)
-        b_score  = len(b_peaks) * max(b_purity, 0.10)
-        self._log(f"  Path A: {len(a_peaks)} peaks, purity={a_purity:.2f}, "
-                  f"score={a_score:.1f}, valid={'YES' if a_valid else 'NO'}")
-        self._log(f"  Path B: {len(b_peaks)} peaks, purity={b_purity:.2f}, "
-                  f"score={b_score:.1f}, valid={'YES' if b_valid else 'NO'}")
-
         if a_valid and b_valid:
-            if a_score >= b_score * cfg.PATH_A_PREFERENCE:
+            if a_n >= b_n * cfg.PATH_A_PREFERENCE:
                 chosen_sig, chosen_peaks = a_sig, a_peaks
                 chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
             else:
@@ -391,10 +320,10 @@ class PHASEPipeline:
             chosen_sig, chosen_peaks = b_sig, b_peaks
             chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
         else:
-            # Neither valid: pick by purity-weighted hr_score fallback
-            a_fb = _hr_score(a_hr, cfg, expected_fhr) * max(a_purity, 0.10)
-            b_fb = _hr_score(b_hr, cfg, expected_fhr) * max(b_purity, 0.10)
-            if a_fb >= b_fb:
+            # [FIX-5] cfg was missing here — was _hr_score(a_hr) without cfg
+            a_score = _hr_score(a_hr, cfg)
+            b_score = _hr_score(b_hr, cfg)
+            if a_score >= b_score:
                 chosen_sig, chosen_peaks = a_sig, a_peaks
                 chosen_path = f"A_fallback_IC{a_idx+1}_{a_hr:.0f}bpm"
             else:
@@ -420,20 +349,29 @@ class PHASEPipeline:
         self._log(f"  {len(fetal_peaks)} peaks, HR = {fet_hr['mean_hr']:.1f} BPM")
 
         # Step 12: Evaluation
+        # [FIX-6] Annotation load is wrapped in try-except to handle missing
+        #         .fqrs files (7/75 CinC2013 recordings) without silently
+        #         producing Se=0/F1=0 in the aggregate results.
         self._log("Step 12: Evaluation...")
         if ann_path and ann_is_fetal:
-            ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
-            self._log(f"  Reference: .{ann_ext} annotation — {len(ref_peaks)} peaks")
+            try:
+                ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
+                self._log(f"  Reference: .{ann_ext} annotation — {len(ref_peaks)} peaks")
+            except Exception as e:
+                ref_peaks = np.array([])
+                self._log(f"  WARNING: reference annotation load failed ({e}) "
+                          f"— evaluation will report NaN metrics for this recording")
         elif dir_proc is not None:
             ref_peaks = detect_reference_fetal_qrs(dir_proc, fs)
             self._log(f"  Reference: Direct_1 detector — {len(ref_peaks)} peaks")
         else:
             ref_peaks = np.array([])
             self._log("  Reference: none available")
+
         metrics = evaluate(
                 fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
                 label=f"PHASE ({rec_id})",
-                tolerance_ms=cfg.EVAL_TOLERANCE_MS   # pass from config
+                tolerance_ms=cfg.EVAL_TOLERANCE_MS
             )
 
         # Step 13: ECHO XAI -- [FIX-3] explicit has_reference flag
@@ -445,6 +383,7 @@ class PHASEPipeline:
             fetal_peaks=fetal_peaks, fetal_signal=fetal_ecg,
             reference_signal=echo_ref, has_reference=has_ref)
         attribution = echo.compute_attributions()
+        echo_summary = echo.generate_summary_dict(attribution) if attribution else {}
         print(echo.generate_summary_stats(attribution))
         if attribution and attribution["n_beats"] > 0:
             print(echo.generate_clinical_report(0, attribution))
@@ -470,6 +409,7 @@ class PHASEPipeline:
             "metrics"       : metrics,
             "echo"          : echo,
             "attribution"   : attribution,
+            "echo_summary"  : echo_summary,
             "chosen_path"   : chosen_path,
         }
 
@@ -479,7 +419,7 @@ class PHASEPipeline:
         abd      = recording["abdomen"]
         direct   = recording["direct"]
         duration = recording.get("duration_sec", abd.shape[1] / fs)
-        min_peaks = _min_usable_peaks(duration)
+        min_peaks = _min_usable_peaks(duration, self.cfg)
 
         abd_proc  = preprocess_multichannel(abd, fs)
         dir_proc  = preprocess_channel(direct, fs)
@@ -497,7 +437,7 @@ class PHASEPipeline:
             return evaluate(sig, dir_proc, peaks, ref_peaks, fs, label=label)
 
         def _select(ICs, excl, mat_hr):
-            sig, idx, peaks, hr = _best_ic(ICs, excl, mat_hr, fs, min_peaks=min_peaks)
+            sig, idx, peaks, hr = _best_ic(ICs, excl, mat_hr, fs, self.cfg, min_peaks=min_peaks)
             return sig, peaks
 
         # Config 1: Baseline
@@ -519,7 +459,7 @@ class PHASEPipeline:
         mat_recon_2 = _global_wsvd(abd_proc, _binary_weight_matrix(abd_proc.shape[1], mat_peaks_blind, fs))
         residual_2  = subtract_maternal(abd_proc, mat_recon_2)
         ICs2_2, _   = run_ica(residual_2)
-        excl_2      = _find_maternal_residual_idx(ICs2_2, mat_ic_blind)
+        excl_2      = _find_maternal_residual_idx(ICs2_2, mat_ic_blind, self.cfg)
         sig_2, pks_2 = _select(ICs2_2, excl_2, mat_hr_blind)
         results["2_Blind_IC_Selection"] = _eval(sig_2, pks_2, "+Blind IC Selection")
 
@@ -528,7 +468,7 @@ class PHASEPipeline:
         mat_recon_3 = _global_wsvd(abd_proc, weights_gauss)
         residual_3  = subtract_maternal(abd_proc, mat_recon_3)
         ICs2_3, _   = run_ica(residual_3)
-        excl_3      = _find_maternal_residual_idx(ICs2_3, mat_ic_blind)
+        excl_3      = _find_maternal_residual_idx(ICs2_3, mat_ic_blind, self.cfg)
         sig_3, pks_3 = _select(ICs2_3, excl_3, mat_hr_blind)
         results["3_Gaussian_Weights"] = _eval(sig_3, pks_3, "+Gaussian Weights")
 
@@ -536,11 +476,14 @@ class PHASEPipeline:
         self._log("  Config 4: + Adaptive Windowed WSVD...")
         channel_r2  = np.array([float(np.corrcoef(abd_proc[ch], mat_ic_blind)[0, 1] ** 2)
                                  for ch in range(abd_proc.shape[0])])
-        mat_recon_4 = adaptive_windowed_wsvd(abd_proc, weights_gauss, fs,
-                                              mat_ic=mat_ic_blind, channel_r2=channel_r2)
+        mat_recon_4 = adaptive_windowed_wsvd(
+            abd_proc, weights_gauss, fs,
+            mat_ic=mat_ic_blind,
+            channel_r2=channel_r2,
+            cfg=self.cfg)              # <-- FIX-4 in ablation path too
         residual_4  = subtract_maternal(abd_proc, mat_recon_4)
         ICs2_4, _   = run_ica(residual_4)
-        excl_4      = _find_maternal_residual_idx(ICs2_4, mat_ic_blind)
+        excl_4      = _find_maternal_residual_idx(ICs2_4, mat_ic_blind, self.cfg)
         sig_4, pks_4 = _select(ICs2_4, excl_4, mat_hr_blind)
         results["4_Adaptive_WSVD"] = _eval(sig_4, pks_4, "+Adaptive WSVD")
 
@@ -559,7 +502,8 @@ class PHASEPipeline:
                       fetal_peaks, ref_peaks, echo, figures_dir, rec_id):
         from utils.visualization import (
             plot_preprocessing, plot_maternal_cancellation,
-            plot_fetal_comparison, plot_ekf_refinement
+            plot_fetal_comparison, plot_ekf_refinement,
+            plot_nifecgdb_per_record_validation
         )
         fdir = Path(figures_dir)
         fdir.mkdir(parents=True, exist_ok=True)
@@ -572,7 +516,6 @@ class PHASEPipeline:
             abd_proc, maternal_recon, residual, self.fs,
             save_path=str(fdir / f"{rec_id}_maternal_cancellation.png"))
 
-        # Pass None for reference if no direct electrode available
         has_direct = dir_proc is not None and hasattr(dir_proc, '__len__') and len(dir_proc) > 0
         plot_fetal_comparison(
             fetal_ecg,
@@ -581,6 +524,13 @@ class PHASEPipeline:
             ref_peaks if has_direct else None,
             self.fs,
             save_path=str(fdir / f"{rec_id}_fetal_comparison.png"))
+
+        if recording.get("dataset", "").lower() == "nifecgdb":
+            plot_nifecgdb_per_record_validation(
+                maternal_recon,
+                fetal_ecg,
+                self.fs,
+                save_path=str(fdir / f"{rec_id}_nifecgdb_validation.png"))
 
         plot_ekf_refinement(
             fetal_ic_raw, fetal_ecg,

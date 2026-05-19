@@ -7,7 +7,24 @@ Characteristics:
 - Variable number of abdominal channels (3-4, zero-padded to 4)
 - 2 thoracic channels (maternal ECG, excluded from analysis)
 - No direct fetal electrode
-- .edf.qrs annotation files for ground truth
+- .edf.qrs annotation files — contain MATERNAL QRS beats (from thoracic leads)
+
+ANNOTATION CLARIFICATION:
+  annotation_is_fetal = False  (NIFECGDB .qrs = maternal beats, not fetal)
+
+  The .edf.qrs files were annotated from the thoracic (chest wall) leads by
+  the original dataset authors. They record maternal R-peak positions and are
+  intended for:
+    1. Validating maternal cancellation quality (energy at maternal beat
+       positions should drop after WSVD subtraction).
+    2. Cross-checking the pipeline's own maternal peak detector.
+    3. Providing a precise maternal HR prior for HR-separation gating.
+
+  They must NOT be used as fetal F1 reference — doing so (annotation_is_fetal=True,
+  the previous bug) compared detected fetal peaks to maternal beat positions,
+  producing nonsense Se/PPV/F1 numbers.
+
+FIX [BUG-NIFECGDB]: annotation_is_fetal changed from True to False.
 """
 
 import pyedflib
@@ -24,7 +41,7 @@ class NIFECGDBHandler(AbstractDatasetHandler):
     def __init__(self, abdominal_prefix=None, thoracic_prefix=None, max_abd_channels=4):
         """
         Initialize NIFECGDB handler with channel name patterns.
-        
+
         Parameters
         ----------
         abdominal_prefix : str, optional
@@ -46,21 +63,22 @@ class NIFECGDBHandler(AbstractDatasetHandler):
     def load_single_recording(self, filepath: str) -> Dict[str, Any]:
         """
         Load one NIFECGDB EDF file.
-        
+
         Channel layout varies per record:
         - 2 thoracic channels (maternal ECG) — excluded
         - 3-4 abdominal channels — used for analysis
-        
+
         Parameters
         ----------
         filepath : str
             Path to .edf file.
-        
+
         Returns
         -------
         dict
             Recording dictionary. Note: 'direct' is None (no direct electrode).
-        
+            'annotation_is_fetal' is False — .qrs annotations are maternal.
+
         Raises
         ------
         FileNotFoundError
@@ -130,7 +148,14 @@ class NIFECGDBHandler(AbstractDatasetHandler):
             "direct": None,  # No direct electrode for NIFECGDB
             "annotation_path": str(filepath.parent / filepath.name) if ann_path.exists() else None,
             "annotation_ext": "qrs",
-            "annotation_is_fetal": True,  # NIFECGDB .qrs contain maternal beats, not fetal
+            # [FIX-NIFECGDB] Corrected from True to False.
+            # .edf.qrs files contain MATERNAL beats (from thoracic leads).
+            # The pipeline uses annotation_is_fetal=False to:
+            #   - skip using these peaks as the fetal HR prior
+            #   - skip computing fetal F1 against these peaks
+            # Instead, use NIFECGDBEvaluator to exploit maternal annotations
+            # for cancellation quality checks.
+            "annotation_is_fetal": False,
             "n_abd_channels": n_abd,
         }
 
@@ -138,19 +163,19 @@ class NIFECGDBHandler(AbstractDatasetHandler):
                            max_recordings: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Load all NIFECGDB recordings from a directory.
-        
+
         Parameters
         ----------
         directory : str
             Path to NIFECGDB folder.
         max_recordings : int, optional
             If set, load at most this many recordings.
-        
+
         Returns
         -------
         list of dict
             List of recording dictionaries.
-        
+
         Raises
         ------
         FileNotFoundError
@@ -158,7 +183,7 @@ class NIFECGDBHandler(AbstractDatasetHandler):
         """
         directory = Path(directory)
         edf_files = sorted(directory.glob("*.edf"))
-        
+
         if not edf_files:
             raise FileNotFoundError(f"No EDF files found in {directory}")
 

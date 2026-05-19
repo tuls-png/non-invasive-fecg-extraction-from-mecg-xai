@@ -177,6 +177,85 @@ def plot_fetal_comparison(fetal_estimated: np.ndarray,
         fig.savefig(save_path, dpi=FIG_DPI, bbox_inches="tight", facecolor="white")
     return fig
 
+
+def plot_nifecgdb_per_record_validation(maternal_recon: np.ndarray,
+                                         fetal_ecg: np.ndarray,
+                                         fs: int,
+                                         start_sec: float = 0,
+                                         duration_sec: float = 8,
+                                         channel: int = 0,
+                                         save_path: str = None) -> plt.Figure:
+    """Plot per-record NIFECGDB validation: maternal ECG, detected ECG, and ratio."""
+    _apply_style()
+    n_samples = maternal_recon.shape[1]
+    s = int(start_sec * fs)
+    e = min(s + int(duration_sec * fs), n_samples)
+    t = np.arange(s, e) / fs
+
+    maternal_trace = maternal_recon[channel, s:e]
+    detected_trace = fetal_ecg[s:e]
+    ratio = np.abs(maternal_trace) / (np.abs(detected_trace) + 1e-6)
+    ratio = np.clip(ratio, 0, 50)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+    axes[0].plot(t, maternal_trace, color=COLORS["maternal"], lw=0.8)
+    axes[0].set_ylabel("Amplitude (a.u.)")
+    axes[0].set_title(f"Actual maternal ECG estimate — channel {channel+1}")
+
+    axes[1].plot(t, detected_trace, color=COLORS["fetal_est"], lw=0.8)
+    axes[1].set_ylabel("Amplitude (a.u.)")
+    axes[1].set_title("PHASE detected fetal ECG")
+
+    axes[2].plot(t, ratio, color=COLORS["residual"], lw=0.8)
+    axes[2].set_ylabel("|Maternal| / |Detected| ratio")
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_title("Maternal-to-detected ECG amplitude ratio")
+    axes[2].set_ylim(0, max(5.0, float(np.nanmax(ratio)) * 1.05))
+
+    plt.tight_layout()
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=FIG_DPI, bbox_inches="tight", facecolor="white")
+    return fig
+
+
+def plot_nifecgdb_peak_count_summary(records: list[dict], save_path: str = None) -> plt.Figure:
+    """Plot NIFECGDB maternal peak counts for all samples."""
+    _apply_style()
+    if not records:
+        raise ValueError("No NIFECGDB records provided for peak count summary.")
+
+    labels = [str(r.get("recording", f"rec{i}")) for i, r in enumerate(records)]
+    ref_counts = [float(r.get("maternal_ref_peaks", r.get("n_ref_maternal", np.nan)) or np.nan)
+                  for r in records]
+    mat_counts = [float(r.get("pipeline_maternal_peaks", r.get("n_detected_maternal", np.nan)) or np.nan)
+                  for r in records]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.4 + 4), 5))
+    ax.bar(x - width / 2, ref_counts, width, label="Reference maternal peaks (.qrs)",
+           color=COLORS["peaks_ref"], alpha=0.85)
+    ax.bar(x + width / 2, mat_counts, width, label="Pipeline maternal peaks",
+           color=COLORS["peaks_est"], alpha=0.85)
+
+    ax.set_xlabel("Recording")
+    ax.set_ylabel("Peak count")
+    ax.set_title("NIFECGDB maternal peak counts: reference vs pipeline")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.4)
+
+    plt.tight_layout()
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=FIG_DPI, bbox_inches="tight", facecolor="white")
+    return fig
+
+
 def plot_ablation_results(ablation_data: dict,
                            metric: str = "F1",
                            std_data: dict = None,

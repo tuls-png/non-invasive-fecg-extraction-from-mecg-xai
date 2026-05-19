@@ -495,3 +495,64 @@ ECHO Recording Summary
 ----------------------------------------
 """
         return summary
+
+    def _extract_clinical_note(self, report: str) -> str:
+        lines = report.splitlines()
+        note_lines = []
+        collecting = False
+        for line in lines:
+            if "CLINICAL NOTE:" in line:
+                collecting = True
+                tail = line.split("CLINICAL NOTE:", 1)[-1].strip()
+                if tail:
+                    note_lines.append(tail)
+                continue
+            if collecting:
+                if not line.strip():
+                    break
+                note_lines.append(line.strip())
+        return " ".join(note_lines).strip()
+
+    def generate_summary_dict(self, attribution: dict) -> dict:
+        """Return a structured recording-level ECHO summary for CSV export."""
+        if not attribution:
+            return {}
+
+        hr      = np.asarray(attribution.get("hr_values", []), dtype=float)
+        n_beats = int(attribution.get("n_beats", 0))
+        normal  = int(np.sum((hr >= FETAL_HR_MIN) & (hr <= 160))) if n_beats > 0 else 0
+        brady   = int(np.sum(hr < FETAL_HR_MIN)) if n_beats > 0 else 0
+        tachy   = int(np.sum(hr > 160)) if n_beats > 0 else 0
+        normal_pct = float(100.0 * normal / n_beats) if n_beats > 0 else np.nan
+        brady_pct  = float(100.0 * brady / n_beats) if n_beats > 0 else np.nan
+        tachy_pct  = float(100.0 * tachy / n_beats) if n_beats > 0 else np.nan
+
+        has_morph = attribution.get("has_morphology", False)
+        morph_mean = float(np.nanmean(attribution.get("morph_attribution", np.array([np.nan])))) * 100.0
+        hr_mean    = float(np.nanmean(hr)) if n_beats > 0 else np.nan
+        hr_std     = float(np.nanstd(hr)) if n_beats > 0 else np.nan
+        mean_conf  = float(np.nanmean(attribution.get("confidence", np.array([np.nan])))) * 100.0
+
+        clinical_report = self.generate_clinical_report(0, attribution)
+        clinical_note = self._extract_clinical_note(clinical_report)
+
+        return {
+            "n_beats"                    : n_beats,
+            "mean_fetal_hr"              : round(hr_mean, 1) if not np.isnan(hr_mean) else "",
+            "fetal_hr_std"               : round(hr_std, 1) if not np.isnan(hr_std) else "",
+            "maternal_hr"                : round(self.maternal_hr, 1) if not np.isnan(self.maternal_hr) else "",
+            "hr_separation"              : round(abs(hr_mean - self.maternal_hr), 1) if n_beats > 0 and not np.isnan(self.maternal_hr) else "",
+            "normal_hr_beats"            : normal,
+            "normal_hr_pct"              : round(normal_pct, 1) if not np.isnan(normal_pct) else "",
+            "bradycardia_beats"          : brady,
+            "bradycardia_pct"            : round(brady_pct, 1) if not np.isnan(brady_pct) else "",
+            "tachycardia_beats"          : tachy,
+            "tachycardia_pct"            : round(tachy_pct, 1) if not np.isnan(tachy_pct) else "",
+            "mean_hr_contrast_pct"       : round(float(np.nanmean(attribution.get("hr_attribution", np.array([np.nan])))) * 100.0, 1),
+            "mean_morphology_pct"        : round(morph_mean, 1) if has_morph else "N/A",
+            "mean_temporal_independence_pct" : round(float(np.nanmean(attribution.get("indep_attribution", np.array([np.nan])))) * 100.0, 1),
+            "mean_confidence_pct"        : round(mean_conf, 1) if not np.isnan(mean_conf) else "",
+            "has_morphology"             : bool(has_morph),
+            "clinical_note"              : clinical_note,
+            "clinical_explanation"       : clinical_report.strip(),
+        }

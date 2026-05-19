@@ -2,13 +2,22 @@
 run_experiment_new.py
 Updated entry point using the new streamlined dataset/config architecture.
 
-This is an example of the RECOMMENDED approach. The original run_experiment.py
-still works (backward compatible), but this shows cleaner patterns.
+This is the RECOMMENDED approach. The original run_experiment.py still works
+(backward compatible), but this shows cleaner patterns.
 
 Usage:
     python run_experiment_new.py --dataset adfecgdb --mode full
     python run_experiment_new.py --dataset nifecgdb --mode full --max_recordings 10
+    python run_experiment_new.py --dataset cinc2013 --mode full
     python run_experiment_new.py --dataset adfecgdb --mode single --recording r01.edf
+
+NIFECGDB NOTE:
+    For NIFECGDB, run_full_dataset() runs the three maternal-annotation-based
+    validation checks (see evaluation/nifecgdb_evaluator.py) in addition to
+    the standard pipeline metrics. Results are written to:
+      - results_nifecgdb/results_<timestamp>.csv                — standard pipeline metrics
+      - results_nifecgdb/nifecgdb_validation_summary_<timestamp>.csv — validation summary
+      - results_nifecgdb/echo_master_table_nifecgdb.csv        — Master Explainability Table
 """
 import matplotlib
 matplotlib.use('Agg')
@@ -25,49 +34,65 @@ from pipeline import PHASEPipeline
 from evaluation.metrics import aggregate_results, wilcoxon_test
 from utils.logger import ResultsLogger
 from utils.visualization import plot_ablation_results, plot_sota_comparison
+from xai.echo_master_table import ECHOMasterTableGenerator
 
 
-def run_full_dataset(dataset_name: str, data_dir: str, save_figures: bool = True, max_recordings: int = None):
+def run_full_dataset(dataset_name: str, data_dir: str,
+                     save_figures: bool = True,
+                     max_recordings: int = None):
     """
     Run PHASE on all recordings in a dataset.
-    
+
+    For NIFECGDB, also runs the three maternal-annotation-based validation
+    checks (NIFECGDBEvaluator) and writes a second CSV with those results.
+
     Parameters
     ----------
     dataset_name : str
-        Dataset identifier ('adfecgdb' or 'nifecgdb').
+        Dataset identifier ('adfecgdb', 'nifecgdb', 'cinc2013').
     data_dir : str
         Path to dataset directory.
     save_figures : bool
         Whether to save output figures.
+    max_recordings : int, optional
+        Cap on number of recordings to process.
     """
     print("\n" + "="*70)
     print(f"  PHASE Pipeline — {dataset_name.upper()} Full Experiment")
     print("="*70 + "\n")
 
-    # Get dataset-specific config and handler
-    config = get_config(dataset_name)
+    config  = get_config(dataset_name)
     handler = get_dataset(dataset_name)
-    '''
-    ablation = "recordings = handler.load_all_recordings(
-    data_dir,
-    max_recordings=getattr(args, 'max_recordings', None)
-)"
-    '''
-    # Load all recordings from dataset
-    recordings = handler.load_all_recordings(data_dir,max_recordings=max_recordings)
+
+    recordings = handler.load_all_recordings(data_dir, max_recordings=max_recordings)
     if not recordings:
         print(f"[ERROR] No recordings found in {data_dir}")
         return []
 
-    # Run pipeline on each recording
-    pipe = PHASEPipeline(verbose=True, dataset=dataset_name)
+    pipe   = PHASEPipeline(verbose=True, dataset=dataset_name)
     logger = ResultsLogger(f"results_{dataset_name}")
+    echo_master_gen = ECHOMasterTableGenerator()
+
+    # NIFECGDB-specific: set up the maternal-annotation evaluator and logger
+    is_nifecgdb = dataset_name.lower() == "nifecgdb"
+    if is_nifecgdb:
+        from evaluation.nifecgdb_evaluator import NIFECGDBEvaluator, NIFECGDBResultsLogger
+        nif_evaluator = NIFECGDBEvaluator(
+            fs=recordings[0]["fs"],
+            tolerance_ms=config.EVAL_TOLERANCE_MS,
+            fetal_hr_min=config.FETAL_HR_MIN,
+            fetal_hr_max=config.FETAL_HR_MAX,
+            hr_sep_min=config.HR_SEP_MIN_BPM,
+        )
+        nif_logger = NIFECGDBResultsLogger(f"results_{dataset_name}")
+        print("[INFO] NIFECGDB mode: maternal-annotation checks enabled "
+              "(nifecgdb_evaluator). Fetal F1 will be NaN (no ground truth).")
+
     all_metrics = []
 
     for rec in recordings:
-        # Use handler's summary method
         handler.print_recording_summary(rec)
-        
+
         try:
             result = pipe.run(
                 rec,
@@ -76,48 +101,75 @@ def run_full_dataset(dataset_name: str, data_dir: str, save_figures: bool = True
             )
             logger.log_recording(rec["recording"], f"PHASE_{dataset_name}", result["metrics"])
             all_metrics.append(result["metrics"])
+
+            # Add ECHO summary to Master Table Generator
+            if result.get("echo_summary"):
+                echo_master_gen.add_summary_record(
+                    recording=rec["recording"],
+                    method=f"PHASE_{dataset_name}",
+                    summary=result["echo_summary"]
+                )
+
+            # NIFECGDB: run and log three validation checks
+            if is_nifecgdb:
+                checks = nif_evaluator.run_all_checks(
+                    recording=rec,
+                    result=result,
+                    maternal_ref_peaks=None,  # loaded inside from annotation_path
+                )
+                nif_logger.log(checks)
+
         except Exception as e:
             print(f"[ERROR] {rec['recording']}: {e}")
             import traceback
             traceback.print_exc()
             continue
 
-    # Print summary
+    # Print aggregate summary
     print("\n" + "="*70)
     print(f"  {dataset_name.upper()} AGGREGATE RESULTS")
     print("="*70)
-    aggregate_results(all_metrics)
+    agg_metrics = aggregate_results(all_metrics)
     logger.save()
-    
+    echo_master_gen.save_csv(dataset_name, f"results_{dataset_name}")
+    if not is_nifecgdb:
+        logger.save_summary(agg_metrics)
+
+    if is_nifecgdb:
+        nif_logger.save()
+
     return all_metrics
 
 
-def run_ablation_dataset(dataset_name: str, data_dir: str, max_recordings: int = None):
+def run_ablation_dataset(dataset_name: str, data_dir: str,
+                         max_recordings: int = None):
     """
     Run ablation studies on a dataset.
-    
+
     Parameters
     ----------
     dataset_name : str
         Dataset identifier.
-    data_dir : str, identifier.
+    data_dir : str
         Path to dataset directory.
+    max_recordings : int, optional
+        Cap on number of recordings.
     """
     print("\n" + "="*70)
     print(f"  PHASE Pipeline — {dataset_name.upper()} Ablation Study")
     print("="*70 + "\n")
 
-    config = get_config(dataset_name)
+    config  = get_config(dataset_name)
     handler = get_dataset(dataset_name)
-    
-    recordings = handler.load_all_recordings(data_dir,max_recordings=max_recordings)
-    pipe = PHASEPipeline(verbose=True, dataset=dataset_name)
+
+    recordings = handler.load_all_recordings(data_dir, max_recordings=max_recordings)
+    pipe   = PHASEPipeline(verbose=True, dataset=dataset_name)
     logger = ResultsLogger(f"results_ablation_{dataset_name}")
     config_metrics = {}
 
     for rec in recordings:
         handler.print_recording_summary(rec)
-        
+
         try:
             ablation_results = pipe.run_with_ablation(rec)
             for config_name, metrics in ablation_results.items():
@@ -134,21 +186,22 @@ def run_ablation_dataset(dataset_name: str, data_dir: str, max_recordings: int =
     if ("1_Baseline_ICA_WSVD" in config_metrics and
             "5_PHASE_Full" in config_metrics):
         baseline_f1 = [r["F1"] for r in config_metrics["1_Baseline_ICA_WSVD"]]
-        phase_f1 = [r["F1"] for r in config_metrics["5_PHASE_Full"]]
+        phase_f1    = [r["F1"] for r in config_metrics["5_PHASE_Full"]]
         wilcoxon_test(phase_f1, baseline_f1, metric_name="F1")
 
     # Generate ablation plot
     ablation_mean, ablation_std = {}, {}
-    for config, records in sorted(config_metrics.items()):
+    for config_name, records in sorted(config_metrics.items()):
         f1_vals = [r["F1"] for r in records]
-        short = config.split("_", 1)[1].replace("_", " ")
+        short   = config_name.split("_", 1)[1].replace("_", " ")
         ablation_mean[short] = float(np.mean(f1_vals))
-        ablation_std[short] = float(np.std(f1_vals))
+        ablation_std[short]  = float(np.std(f1_vals))
 
     Path("figures").mkdir(exist_ok=True)
     fig = plot_ablation_results(
         ablation_mean, metric="F1 (%)",
-        std_data=ablation_std, save_path=f"figures/ablation_f1_{dataset_name}.png"
+        std_data=ablation_std,
+        save_path=f"figures/ablation_f1_{dataset_name}.png"
     )
     fig.show()
 
@@ -158,7 +211,7 @@ def run_ablation_dataset(dataset_name: str, data_dir: str, max_recordings: int =
 def run_single_recording(dataset_name: str, filepath: str):
     """
     Run PHASE on a single recording.
-    
+
     Parameters
     ----------
     dataset_name : str
@@ -170,13 +223,13 @@ def run_single_recording(dataset_name: str, filepath: str):
     print(f"  PHASE Pipeline — Single Recording ({dataset_name.upper()})")
     print("="*70 + "\n")
 
-    config = get_config(dataset_name)
+    config  = get_config(dataset_name)
     handler = get_dataset(dataset_name)
-    
+
     rec = handler.load_single_recording(filepath)
     handler.print_recording_summary(rec)
 
-    pipe = PHASEPipeline(verbose=True, dataset=dataset_name)
+    pipe   = PHASEPipeline(verbose=True, dataset=dataset_name)
     result = pipe.run(rec, save_figures=True, figures_dir="figures")
 
     print("\nFinal Metrics:")
@@ -184,7 +237,15 @@ def run_single_recording(dataset_name: str, filepath: str):
         if isinstance(v, float):
             print(f"  {k:<20}: {v:.4f}")
 
-    # Show attribution heatmap if ECHO is available
+    # NIFECGDB: run validation checks for single recording too
+    if dataset_name.lower() == "nifecgdb":
+        from evaluation.nifecgdb_evaluator import NIFECGDBEvaluator, NIFECGDBResultsLogger
+        nif_evaluator = NIFECGDBEvaluator(fs=rec["fs"])
+        checks = nif_evaluator.run_all_checks(recording=rec, result=result)
+        nif_logger = NIFECGDBResultsLogger("results_nifecgdb")
+        nif_logger.log(checks)
+        nif_logger.save()
+
     if hasattr(result.get("echo"), "plot_attribution_heatmap"):
         result["echo"].plot_attribution_heatmap(window_sec=10)
         import matplotlib.pyplot as plt
@@ -206,6 +267,7 @@ def main():
     default_cinc2013 = str(
         Path(__file__).parent / "dataset_handlers" / "set-a"
     )
+
     parser = argparse.ArgumentParser(
         description="PHASE Fetal ECG Pipeline — Streamlined Version",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -213,10 +275,13 @@ def main():
 Examples:
     # Run full experiment on ADFECGDB
     python run_experiment_new.py --dataset adfecgdb --mode full
-    
-    # Run ablation study on NIFECGDB (first 20 recordings)
-    python run_experiment_new.py --dataset nifecgdb --mode ablation --max_recordings 20
-    
+
+    # Run full experiment on NIFECGDB (writes two CSVs: metrics + checks)
+    python run_experiment_new.py --dataset nifecgdb --mode full
+
+    # Run ablation study on CinC2013
+    python run_experiment_new.py --dataset cinc2013 --mode ablation
+
     # Run single recording
     python run_experiment_new.py --dataset adfecgdb --mode single --recording r01.edf
         """
@@ -257,7 +322,7 @@ Examples:
     elif args.dataset == "nifecgdb":
         data_dir = default_nifecgdb
     elif args.dataset == "cinc2013":
-        data_dir = default_cinc2013 
+        data_dir = default_cinc2013
     else:
         data_dir = default_adfecgdb
 
@@ -269,21 +334,23 @@ Examples:
     # Print configuration info
     config = get_config(args.dataset)
     print(f"\n[CONFIG] Using {args.dataset.upper()}")
-    print(f"[CONFIG] FETAL_HR_LOW: {config.FETAL_HR_LOW}")
-    print(f"[CONFIG] FETAL_HR_HIGH: {config.FETAL_HR_HIGH}")
-    print(f"[CONFIG] ICA_N_COMPONENTS: {config.ICA_N_COMPONENTS}\n")
+    print(f"[CONFIG] FETAL_HR_LOW:        {config.FETAL_HR_LOW}")
+    print(f"[CONFIG] FETAL_HR_HIGH:       {config.FETAL_HR_HIGH}")
+    print(f"[CONFIG] WSVD_CHANNEL_R2_MIN: {config.WSVD_CHANNEL_R2_MIN}")
+    print(f"[CONFIG] ICA_N_COMPONENTS:    {config.ICA_N_COMPONENTS}\n")
 
     # Execute selected mode
     if args.mode == "single":
         if args.recording:
             filepath = args.recording
         else:
-            # Find first EDF
-            edfs = sorted(data_path.glob("*.edf"))
-            if not edfs:
-                print(f"[ERROR] No EDF files found in {data_dir}")
+            # Find first EDF for ADFECGDB/NIFECGDB, first .hea for CinC2013
+            ext = "*.hea" if args.dataset == "cinc2013" else "*.edf"
+            files = sorted(data_path.glob(ext))
+            if not files:
+                print(f"[ERROR] No {ext} files found in {data_dir}")
                 sys.exit(1)
-            filepath = str(edfs[0])
+            filepath = str(files[0])
             print(f"[INFO] No --recording specified, using: {filepath}")
 
         run_single_recording(args.dataset, filepath)
@@ -296,7 +363,10 @@ Examples:
         )
 
     elif args.mode == "ablation":
-        run_ablation_dataset(args.dataset, str(data_path))
+        run_ablation_dataset(
+            args.dataset, str(data_path),
+            max_recordings=args.max_recordings
+        )
 
 
 if __name__ == "__main__":
