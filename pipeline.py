@@ -385,6 +385,634 @@ class PHASEPipeline:
             "chosen_path"   : chosen_path,
         }
 
+    def run_sequential(self, recording, save_figures=False, figures_dir="figures"):
+        """
+        Sequential Path A→B pipeline (PHASE-SEQ).
+
+        Instead of choosing between Path A and Path B, this method uses Path A's
+        maternal IC estimate to produce a *cleaner* multichannel residual before
+        running Path B's WSVD+ICA2 stage.
+
+        Pipeline:
+          Step 1-3  : Same as PHASE (preprocess, ICA1, maternal QRS)
+          Step 4    : Path A — select best fetal IC from ICA1 (same as before)
+          Step 5-6  : Reproject Path A's maternal IC onto each channel and
+                      subtract it, producing an improved multichannel residual.
+                      This is *additional* maternal cancellation on top of the
+                      raw signal, before WSVD is even applied.
+          Step 7    : Gaussian weights (same)
+          Step 8    : AW-WSVD on the Path-A-cleaned residual (instead of raw)
+          Step 9    : Subtract WSVD maternal reconstruction from Path-A residual
+          Step 10   : ICA2 on the doubly-cleaned residual → Path B (sequential)
+          Step 11   : EKF-RTS on the sequential Path B output
+          Step 12-13: Evaluation + ECHO XAI
+        """
+        cfg      = self.cfg
+        dataset  = recording.get("dataset", "ADFECGDB")
+        rec_id   = recording["recording"]
+        abd      = recording["abdomen"]
+        direct   = recording.get("direct")
+        fs       = recording["fs"]
+        duration = recording.get("duration_sec", abd.shape[1] / fs)
+        min_peaks = _min_usable_peaks(duration, cfg, dataset)
+
+        self._log("=" * 55)
+        self._log(f"[SEQ] Processing: {rec_id}  [{recording.get('dataset','?')}]")
+        self._log(f"Duration: {duration:.1f}s  |  min_usable_peaks: {min_peaks}")
+        self._log("=" * 55)
+
+        # Step 1: Preprocess
+        self._log("Step 1: Preprocessing...")
+        abd_proc = preprocess_multichannel(abd, fs)
+        dir_proc = preprocess_channel(direct, fs) if direct is not None else None
+
+        # Step 2: ICA1
+        self._log("Step 2: ICA1...")
+        ICs1, unmixing1    = run_ica(abd_proc, n_components=cfg.ICA_N_COMPONENTS)
+        maternal_ic_idx, _ = select_maternal_ic(ICs1, fs)
+        maternal_ic        = get_ic_as_signal(ICs1, maternal_ic_idx)
+
+        # Step 3: Maternal QRS
+        self._log("Step 3: Maternal QRS detection...")
+        maternal_peaks = detect_maternal_qrs(maternal_ic, fs)
+        mat_hr_stats   = compute_hr_stats(maternal_peaks, fs)
+        maternal_hr    = mat_hr_stats["mean_hr"]
+        self._log(f"  {len(maternal_peaks)} maternal peaks, HR = {maternal_hr:.1f} BPM")
+
+        ann_path     = recording.get("annotation_path")
+        ann_ext      = recording.get("annotation_ext", "qrs")
+        ann_is_fetal = recording.get("annotation_is_fetal", False)
+        expected_fhr = None
+
+        if ann_path and ann_is_fetal:
+            from preprocessing.qrs_detector import load_wfdb_annotation
+            ann_peaks = load_wfdb_annotation(ann_path, ann_ext)
+            if len(ann_peaks) >= 5:
+                ann_stats    = compute_hr_stats(ann_peaks, fs)
+                expected_fhr = ann_stats["mean_hr"]
+                self._log(f"  Annotation prior: expected fetal HR = {expected_fhr:.1f} BPM")
+
+        # Step 4: Path A — ICA1 direct (same as original)
+        self._log("Step 4: Path A -- ICA1 direct (HR-aware scan)...")
+        a_sig, a_idx, a_peaks, a_hr = _best_ic(
+            ICs1, maternal_ic_idx, maternal_hr, fs, cfg,
+            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks)
+        self._log(f"  Path A: IC{a_idx+1}, {len(a_peaks)} peaks, HR={a_hr:.1f} BPM")
+
+        # Step 5: Build Path-A-cleaned multichannel residual.
+        #
+        # Project the maternal IC back onto each channel using least-squares,
+        # then subtract. This removes what ICA1 identified as the maternal
+        # component from all channels simultaneously — better than subtracting
+        # a single template because it respects each channel's mixing coefficient.
+        self._log("Step 5: Path A maternal IC subtraction from all channels...")
+        mat_ic_norm = maternal_ic - np.mean(maternal_ic)
+        denom = np.dot(mat_ic_norm, mat_ic_norm) + 1e-10
+        path_a_residual = np.zeros_like(abd_proc)
+        for ch in range(abd_proc.shape[0]):
+            alpha = np.dot(abd_proc[ch], mat_ic_norm) / denom
+            path_a_residual[ch] = abd_proc[ch] - alpha * mat_ic_norm
+        self._log(f"  Projected and subtracted maternal IC from {abd_proc.shape[0]} channels")
+
+        # Step 6: Gaussian weights (based on maternal peaks, same as original)
+        self._log("Step 6: Gaussian weight matrix...")
+        weights = gaussian_weight_matrix(abd_proc.shape[1], maternal_peaks, fs)
+
+        # Step 7: AW-WSVD on Path-A-cleaned residual (key difference from original)
+        self._log("Step 7: AW-WSVD on Path-A residual (sequential stage)...")
+        svd_explained_variance(path_a_residual)
+        channel_r2 = np.array([
+            float(np.corrcoef(path_a_residual[ch], maternal_ic)[0, 1] ** 2)
+            for ch in range(path_a_residual.shape[0])
+        ])
+        maternal_recon_seq = adaptive_windowed_wsvd(
+            path_a_residual, weights, fs,
+            mat_ic=maternal_ic, channel_r2=channel_r2)
+
+        # Step 8: Subtract WSVD reconstruction from Path-A residual
+        self._log("Step 8: Second maternal cancellation (WSVD subtraction)...")
+        residual_seq = subtract_maternal(path_a_residual, maternal_recon_seq)
+
+        # Step 9: ICA2 on doubly-cleaned residual → sequential Path B
+        self._log("Step 9: ICA2 on doubly-cleaned residual (Path B sequential)...")
+        ICs2_seq, _      = run_ica(residual_seq, n_components=cfg.ICA_N_COMPONENTS)
+        mat_residual_idx = _find_maternal_residual_idx(ICs2_seq, maternal_ic, cfg)
+        seq_sig, seq_idx, seq_peaks, seq_hr = _best_ic(
+            ICs2_seq, mat_residual_idx, maternal_hr, fs, cfg,
+            label="Path B (sequential)", expected_hr=expected_fhr, min_peaks=min_peaks)
+        self._log(f"  Sequential output: IC{seq_idx+1}, {len(seq_peaks)} peaks, "
+                  f"HR={seq_hr:.1f} BPM")
+
+        chosen_sig    = seq_sig
+        chosen_peaks  = seq_peaks
+        chosen_path   = f"SEQ_A_then_B_IC{seq_idx+1}_{seq_hr:.0f}bpm"
+
+        # Step 10: EKF-RTS morphological refinement
+        self._log("Step 10: EKF-RTS morphological refinement...")
+        fetal_ic_raw = chosen_sig
+        if self.ekf_bypass:
+            fetal_ecg = fetal_ic_raw
+            self._log("  EKF bypassed")
+        else:
+            fetal_ecg = _apply_ekf(fetal_ic_raw, chosen_peaks, fs, self.use_rts, cfg=cfg)
+            n_post = len(detect_fetal_qrs(fetal_ecg, fs, cfg=cfg))
+            self._log(f"  EKF complete -- {n_post} peaks post-EKF (was {len(chosen_peaks)})")
+
+        # Step 11: Final QRS detection
+        self._log("Step 11: Final fetal QRS detection...")
+        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
+        fet_hr = compute_hr_stats(fetal_peaks, fs)
+        self._log(f"  {len(fetal_peaks)} peaks, HR = {fet_hr['mean_hr']:.1f} BPM")
+
+        # Step 12: Evaluation
+        self._log("Step 12: Evaluation...")
+        if ann_path and ann_is_fetal:
+            ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
+            self._log(f"  Reference: .{ann_ext} annotation — {len(ref_peaks)} peaks")
+        elif dir_proc is not None:
+            ref_peaks = detect_reference_fetal_qrs(dir_proc, fs)
+            self._log(f"  Reference: Direct_1 detector — {len(ref_peaks)} peaks")
+        else:
+            ref_peaks = np.array([])
+            self._log("  Reference: none available")
+        metrics = evaluate(
+            fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
+            label=f"PHASE-SEQ ({rec_id})",
+            tolerance_ms=cfg.EVAL_TOLERANCE_MS)
+
+        # Step 13: ECHO XAI
+        self._log("Step 13: ECHO XAI...")
+        has_ref  = dir_proc is not None
+        echo_ref = dir_proc if has_ref else None
+        echo = ECHOExplainer(
+            fs=fs, maternal_peaks=maternal_peaks,
+            fetal_peaks=fetal_peaks, fetal_signal=fetal_ecg,
+            reference_signal=echo_ref, has_reference=has_ref)
+        attribution = echo.compute_attributions()
+        print(echo.generate_summary_stats(attribution))
+        if attribution and attribution["n_beats"] > 0:
+            print(echo.generate_clinical_report(0, attribution))
+
+        if save_figures:
+            self._save_figures(
+                recording, abd_proc, maternal_recon_seq, residual_seq,
+                fetal_ecg, fetal_ic_raw, dir_proc,
+                fetal_peaks, ref_peaks, echo, figures_dir, rec_id)
+
+        return {
+            "recording"     : rec_id,
+            "fetal_ecg"     : fetal_ecg,
+            "fetal_ecg_pre" : fetal_ic_raw,
+            "fetal_peaks"   : fetal_peaks,
+            "maternal_peaks": maternal_peaks,
+            "ref_peaks"     : ref_peaks,
+            "maternal_recon": maternal_recon_seq,
+            "residual"      : residual_seq,
+            "abd_proc"      : abd_proc,
+            "dir_proc"      : dir_proc,
+            "weights"       : weights,
+            "metrics"       : metrics,
+            "echo"          : echo,
+            "attribution"   : attribution,
+            "chosen_path"   : chosen_path,
+        }
+
+    # ------------------------------------------------------------------
+    # Shared helper: run all shared steps (1-8) and return intermediates
+    # so fusion methods don't duplicate boilerplate.
+    # ------------------------------------------------------------------
+    def _run_shared_steps(self, recording):
+        """
+        Run steps 1-8 (preprocessing through Path B) and return all
+        intermediates needed by the fusion methods.
+        """
+        cfg      = self.cfg
+        dataset  = recording.get("dataset", "ADFECGDB")
+        rec_id   = recording["recording"]
+        abd      = recording["abdomen"]
+        direct   = recording.get("direct")
+        fs       = recording["fs"]
+        duration = recording.get("duration_sec", abd.shape[1] / fs)
+        min_peaks = _min_usable_peaks(duration, cfg, dataset)
+
+        # Step 1
+        abd_proc = preprocess_multichannel(abd, fs)
+        dir_proc = preprocess_channel(direct, fs) if direct is not None else None
+
+        # Step 2
+        ICs1, _            = run_ica(abd_proc, n_components=cfg.ICA_N_COMPONENTS)
+        maternal_ic_idx, _ = select_maternal_ic(ICs1, fs)
+        maternal_ic        = get_ic_as_signal(ICs1, maternal_ic_idx)
+
+        # Step 3
+        maternal_peaks = detect_maternal_qrs(maternal_ic, fs)
+        mat_hr_stats   = compute_hr_stats(maternal_peaks, fs)
+        maternal_hr    = mat_hr_stats["mean_hr"]
+
+        ann_path     = recording.get("annotation_path")
+        ann_ext      = recording.get("annotation_ext", "qrs")
+        ann_is_fetal = recording.get("annotation_is_fetal", False)
+        expected_fhr = None
+        if ann_path and ann_is_fetal:
+            ann_peaks = load_wfdb_annotation(ann_path, ann_ext)
+            if len(ann_peaks) >= 5:
+                expected_fhr = compute_hr_stats(ann_peaks, fs)["mean_hr"]
+
+        # Step 4: Path A
+        a_sig, a_idx, a_peaks, a_hr = _best_ic(
+            ICs1, maternal_ic_idx, maternal_hr, fs, cfg,
+            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks)
+        a_valid = _is_fetal_hr(a_hr, maternal_hr, cfg)
+
+        # Step 5-7: WSVD path
+        weights    = gaussian_weight_matrix(abd_proc.shape[1], maternal_peaks, fs)
+        svd_explained_variance(abd_proc)
+        channel_r2 = np.array([
+            float(np.corrcoef(abd_proc[ch], maternal_ic)[0, 1] ** 2)
+            for ch in range(abd_proc.shape[0])
+        ])
+        maternal_recon = adaptive_windowed_wsvd(
+            abd_proc, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2)
+        residual = subtract_maternal(abd_proc, maternal_recon)
+
+        # Step 8: Path B
+        ICs2, _          = run_ica(residual, n_components=cfg.ICA_N_COMPONENTS)
+        mat_residual_idx = _find_maternal_residual_idx(ICs2, maternal_ic, cfg)
+        b_sig, b_idx, b_peaks, b_hr = _best_ic(
+            ICs2, mat_residual_idx, maternal_hr, fs, cfg,
+            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks)
+        b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
+
+        return dict(
+            cfg=cfg, rec_id=rec_id, fs=fs, abd_proc=abd_proc,
+            dir_proc=dir_proc, maternal_ic=maternal_ic,
+            maternal_peaks=maternal_peaks, maternal_hr=maternal_hr,
+            maternal_recon=maternal_recon, residual=residual, weights=weights,
+            ann_path=ann_path, ann_ext=ann_ext, ann_is_fetal=ann_is_fetal,
+            expected_fhr=expected_fhr,
+            a_sig=a_sig, a_idx=a_idx, a_peaks=a_peaks, a_hr=a_hr, a_valid=a_valid,
+            b_sig=b_sig, b_idx=b_idx, b_peaks=b_peaks, b_hr=b_hr, b_valid=b_valid,
+        )
+
+    def _run_tail(self, shared, chosen_sig, chosen_peaks, chosen_path,
+                  method_label, save_figures=False, figures_dir="figures"):
+        """
+        Run steps 10-13 (EKF → QRS → eval → ECHO) on the fused signal.
+        Returns the standard result dict.
+        """
+        cfg            = shared["cfg"]
+        fs             = shared["fs"]
+        rec_id         = shared["rec_id"]
+        abd_proc       = shared["abd_proc"]
+        dir_proc       = shared["dir_proc"]
+        maternal_peaks = shared["maternal_peaks"]
+        maternal_recon = shared["maternal_recon"]
+        residual       = shared["residual"]
+        weights        = shared["weights"]
+        ann_path       = shared["ann_path"]
+        ann_ext        = shared["ann_ext"]
+        ann_is_fetal   = shared["ann_is_fetal"]
+
+        # EKF
+        fetal_ic_raw = chosen_sig
+        if self.ekf_bypass:
+            fetal_ecg = fetal_ic_raw
+        else:
+            fetal_ecg = _apply_ekf(fetal_ic_raw, chosen_peaks, fs,
+                                   self.use_rts, cfg=cfg)
+
+        # Final QRS
+        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
+
+        # Reference peaks
+        if ann_path and ann_is_fetal:
+            ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
+        elif dir_proc is not None:
+            ref_peaks = detect_reference_fetal_qrs(dir_proc, fs)
+        else:
+            ref_peaks = np.array([])
+
+        metrics = evaluate(
+            fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
+            label=f"{method_label} ({rec_id})",
+            tolerance_ms=cfg.EVAL_TOLERANCE_MS)
+
+        # ECHO XAI
+        has_ref = dir_proc is not None
+        echo = ECHOExplainer(
+            fs=fs, maternal_peaks=maternal_peaks,
+            fetal_peaks=fetal_peaks, fetal_signal=fetal_ecg,
+            reference_signal=dir_proc if has_ref else None,
+            has_reference=has_ref)
+        attribution = echo.compute_attributions()
+        print(echo.generate_summary_stats(attribution))
+
+        if save_figures:
+            self._save_figures(
+                {"recording": rec_id}, abd_proc, maternal_recon, residual,
+                fetal_ecg, fetal_ic_raw, dir_proc,
+                fetal_peaks, ref_peaks, echo, figures_dir, rec_id)
+
+        return {
+            "recording"     : rec_id,
+            "fetal_ecg"     : fetal_ecg,
+            "fetal_ecg_pre" : fetal_ic_raw,
+            "fetal_peaks"   : fetal_peaks,
+            "maternal_peaks": maternal_peaks,
+            "ref_peaks"     : ref_peaks,
+            "maternal_recon": maternal_recon,
+            "residual"      : residual,
+            "abd_proc"      : abd_proc,
+            "dir_proc"      : dir_proc,
+            "weights"       : weights,
+            "metrics"       : metrics,
+            "echo"          : echo,
+            "attribution"   : attribution,
+            "chosen_path"   : chosen_path,
+        }
+
+    # ------------------------------------------------------------------
+    # Option 1: Simple Ensemble — equal-weight average of A and B signals
+    # ------------------------------------------------------------------
+    def run_ensemble_simple(self, recording, save_figures=False, figures_dir="figures"):
+        """
+        PHASE-ENS-SIMPLE: average Path A and Path B fetal ECG signals
+        with equal (50/50) weight before EKF and QRS detection.
+        Both paths always contribute regardless of individual quality.
+        """
+        self._log("=" * 55)
+        self._log(f"[ENS-SIMPLE] {recording['recording']}")
+        self._log("=" * 55)
+
+        s = self._run_shared_steps(recording)
+        cfg = s["cfg"]
+
+        # Equal-weight average in signal space
+        fused_sig   = 0.5 * s["a_sig"] + 0.5 * s["b_sig"]
+        fused_peaks = detect_fetal_qrs(fused_sig, s["fs"], cfg=cfg)
+
+        # If fused detection collapses, fall back to whichever path had more peaks
+        if len(fused_peaks) < 5:
+            fused_sig   = s["a_sig"] if len(s["a_peaks"]) >= len(s["b_peaks"]) else s["b_sig"]
+            fused_peaks = s["a_peaks"] if len(s["a_peaks"]) >= len(s["b_peaks"]) else s["b_peaks"]
+
+        self._log(f"  A: {len(s['a_peaks'])} peaks @ {s['a_hr']:.1f} BPM | "
+                  f"B: {len(s['b_peaks'])} peaks @ {s['b_hr']:.1f} BPM | "
+                  f"Fused: {len(fused_peaks)} peaks")
+
+        return self._run_tail(s, fused_sig, fused_peaks,
+                              "ENS_SIMPLE", "PHASE-ENS-SIMPLE",
+                              save_figures, figures_dir)
+
+    # ------------------------------------------------------------------
+    # Option 2: Weighted Ensemble — confidence-weighted average
+    # ------------------------------------------------------------------
+    def run_ensemble_weighted(self, recording, save_figures=False, figures_dir="figures"):
+        """
+        PHASE-ENS-WEIGHTED: weight each path's signal by its confidence
+        score (HR score × normalised peak count) before averaging.
+        A path that found more peaks at a more plausible fetal HR
+        contributes more to the fused signal.
+        """
+        self._log("=" * 55)
+        self._log(f"[ENS-WEIGHTED] {recording['recording']}")
+        self._log("=" * 55)
+
+        s   = self._run_shared_steps(recording)
+        cfg = s["cfg"]
+        fs  = s["fs"]
+
+        # Confidence = HR score × peak count (normalised so weights sum to 1)
+        a_hr_score = _hr_score(s["a_hr"], cfg, s["expected_fhr"])
+        b_hr_score = _hr_score(s["b_hr"], cfg, s["expected_fhr"])
+        a_conf = a_hr_score * len(s["a_peaks"])
+        b_conf = b_hr_score * len(s["b_peaks"])
+        total  = a_conf + b_conf + 1e-10
+        w_a    = a_conf / total
+        w_b    = b_conf / total
+
+        self._log(f"  Confidence weights — A: {w_a:.3f}  B: {w_b:.3f}")
+        self._log(f"  A: {len(s['a_peaks'])} peaks @ {s['a_hr']:.1f} BPM | "
+                  f"B: {len(s['b_peaks'])} peaks @ {s['b_hr']:.1f} BPM")
+
+        fused_sig   = w_a * s["a_sig"] + w_b * s["b_sig"]
+        fused_peaks = detect_fetal_qrs(fused_sig, fs, cfg=cfg)
+
+        if len(fused_peaks) < 5:
+            fused_sig   = s["a_sig"] if w_a >= w_b else s["b_sig"]
+            fused_peaks = s["a_peaks"] if w_a >= w_b else s["b_peaks"]
+
+        chosen_path = f"ENS_WEIGHTED_wA={w_a:.2f}_wB={w_b:.2f}"
+        return self._run_tail(s, fused_sig, fused_peaks,
+                              chosen_path, "PHASE-ENS-WEIGHTED",
+                              save_figures, figures_dir)
+
+    # ------------------------------------------------------------------
+    # Option 3: Rescue — Path B only activates when Path A is weak
+    # ------------------------------------------------------------------
+    def run_rescue(self, recording, save_figures=False, figures_dir="figures"):
+        """
+        PHASE-RESCUE: use Path A when it is confident; fall back to
+        Path B only when Path A fails the HR filter OR finds too few peaks.
+
+        Confidence threshold: Path A must pass the fetal HR filter AND
+        find at least cfg.PATH_A_MIN_PEAKS_RESCUE peaks (default = 60% of
+        min_usable_peaks). If it does, Path B is skipped entirely.
+        """
+        self._log("=" * 55)
+        self._log(f"[RESCUE] {recording['recording']}")
+        self._log("=" * 55)
+
+        s   = self._run_shared_steps(recording)
+        cfg = s["cfg"]
+        fs  = s["fs"]
+
+        duration  = recording.get("duration_sec", recording["abdomen"].shape[1] / fs)
+        min_peaks = _min_usable_peaks(duration, cfg, recording.get("dataset", "ADFECGDB"))
+        rescue_threshold = int(min_peaks * getattr(cfg, "RESCUE_THRESHOLD_FRAC", 0.6))
+
+        a_strong = s["a_valid"] and len(s["a_peaks"]) >= rescue_threshold
+
+        if a_strong:
+            chosen_sig, chosen_peaks = s["a_sig"], s["a_peaks"]
+            chosen_path = f"RESCUE_used_A_IC{s['a_idx']+1}_{s['a_hr']:.0f}bpm"
+            self._log(f"  Path A strong ({len(s['a_peaks'])} peaks >= {rescue_threshold}) "
+                      f"→ using Path A, Path B skipped")
+        else:
+            chosen_sig, chosen_peaks = s["b_sig"], s["b_peaks"]
+            chosen_path = f"RESCUE_used_B_IC{s['b_idx']+1}_{s['b_hr']:.0f}bpm"
+            self._log(f"  Path A weak ({len(s['a_peaks'])} peaks, valid={s['a_valid']}) "
+                      f"→ Path B rescue activated")
+
+        return self._run_tail(s, chosen_sig, chosen_peaks,
+                              chosen_path, "PHASE-RESCUE",
+                              save_figures, figures_dir)
+
+    # ------------------------------------------------------------------
+    # Option 4: Peak-level fusion — merge QRS peak lists from A and B
+    # ------------------------------------------------------------------
+    def run_peak_fusion(self, recording, save_figures=False, figures_dir="figures"):
+        """
+        PHASE-PEAK-FUSION: run both paths fully through to QRS detection,
+        then merge their peak lists.
+
+        Fusion rules (applied in order):
+          1. Peaks present in BOTH lists (within tolerance window) → keep,
+             use the one with higher local signal amplitude.
+          2. Peaks present in only one list → keep if no conflicting peak
+             from the other list is within the tolerance window.
+          3. Conflicting single-path peaks (within window but not matched)
+             → keep the one with higher local amplitude.
+
+        The fused peak list is used for evaluation directly.
+        The EKF runs on the confidence-weighted signal (same as ENS-WEIGHTED)
+        purely for waveform quality, but QRS detection uses the fused list.
+        """
+        self._log("=" * 55)
+        self._log(f"[PEAK-FUSION] {recording['recording']}")
+        self._log("=" * 55)
+
+        s   = self._run_shared_steps(recording)
+        cfg = s["cfg"]
+        fs  = s["fs"]
+
+        # Get per-path peak lists (run QRS on each path's signal separately)
+        a_peaks_det = detect_fetal_qrs(s["a_sig"], fs, cfg=cfg)
+        b_peaks_det = detect_fetal_qrs(s["b_sig"], fs, cfg=cfg)
+        self._log(f"  Path A peaks: {len(a_peaks_det)} | Path B peaks: {len(b_peaks_det)}")
+
+        # Merge peak lists
+        tol_samples = int(getattr(cfg, "EVAL_TOLERANCE_MS", 50) * fs / 1000)
+        fused_peaks = self._merge_peak_lists(
+            s["a_sig"], s["b_sig"], a_peaks_det, b_peaks_det, tol_samples)
+        self._log(f"  Fused peaks: {len(fused_peaks)}")
+
+        # Confidence-weighted signal for EKF waveform (not for QRS detection)
+        a_hr_score = _hr_score(s["a_hr"], cfg, s["expected_fhr"])
+        b_hr_score = _hr_score(s["b_hr"], cfg, s["expected_fhr"])
+        a_conf = a_hr_score * len(a_peaks_det) + 1e-10
+        b_conf = b_hr_score * len(b_peaks_det) + 1e-10
+        total  = a_conf + b_conf
+        fused_sig = (a_conf / total) * s["a_sig"] + (b_conf / total) * s["b_sig"]
+
+        # EKF on fused signal using fused peaks
+        fetal_ic_raw = fused_sig
+        if self.ekf_bypass:
+            fetal_ecg = fetal_ic_raw
+        else:
+            fetal_ecg = _apply_ekf(fetal_ic_raw, fused_peaks, fs,
+                                   self.use_rts, cfg=cfg)
+
+        # Use fused peaks directly for evaluation (override EKF re-detection)
+        fused_peaks_final = fused_peaks if len(fused_peaks) >= 5 \
+            else detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
+
+        ann_path     = s["ann_path"]
+        ann_ext      = s["ann_ext"]
+        ann_is_fetal = s["ann_is_fetal"]
+        dir_proc     = s["dir_proc"]
+
+        if ann_path and ann_is_fetal:
+            ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
+        elif dir_proc is not None:
+            ref_peaks = detect_reference_fetal_qrs(dir_proc, fs)
+        else:
+            ref_peaks = np.array([])
+
+        metrics = evaluate(
+            fetal_ecg, dir_proc, fused_peaks_final, ref_peaks, fs,
+            label=f"PHASE-PEAK-FUSION ({s['rec_id']})",
+            tolerance_ms=cfg.EVAL_TOLERANCE_MS)
+
+        has_ref = dir_proc is not None
+        echo = ECHOExplainer(
+            fs=fs, maternal_peaks=s["maternal_peaks"],
+            fetal_peaks=fused_peaks_final, fetal_signal=fetal_ecg,
+            reference_signal=dir_proc if has_ref else None,
+            has_reference=has_ref)
+        attribution = echo.compute_attributions()
+        print(echo.generate_summary_stats(attribution))
+
+        return {
+            "recording"     : s["rec_id"],
+            "fetal_ecg"     : fetal_ecg,
+            "fetal_ecg_pre" : fetal_ic_raw,
+            "fetal_peaks"   : fused_peaks_final,
+            "maternal_peaks": s["maternal_peaks"],
+            "ref_peaks"     : ref_peaks,
+            "maternal_recon": s["maternal_recon"],
+            "residual"      : s["residual"],
+            "abd_proc"      : s["abd_proc"],
+            "dir_proc"      : dir_proc,
+            "weights"       : s["weights"],
+            "metrics"       : metrics,
+            "echo"          : echo,
+            "attribution"   : attribution,
+            "chosen_path"   : f"PEAK_FUSION_A{len(a_peaks_det)}_B{len(b_peaks_det)}_F{len(fused_peaks_final)}",
+        }
+
+    @staticmethod
+    def _merge_peak_lists(sig_a, sig_b, peaks_a, peaks_b, tol_samples):
+        """
+        Merge two QRS peak lists using a tolerance window.
+
+        For each peak in A, look for a matching peak in B within tol_samples.
+        - Match found → keep the one with higher local signal amplitude.
+        - No match → keep the A peak (uncontested).
+        Remaining unmatched B peaks are added (uncontested).
+        Final list is sorted and de-duplicated within tol_samples.
+        """
+        if len(peaks_a) == 0:
+            return peaks_b.copy() if len(peaks_b) > 0 else np.array([], dtype=int)
+        if len(peaks_b) == 0:
+            return peaks_a.copy()
+
+        n = max(len(sig_a), len(sig_b))
+
+        def amp(sig, idx):
+            lo = max(0, idx - 5)
+            hi = min(len(sig), idx + 6)
+            return float(np.max(np.abs(sig[lo:hi])))
+
+        matched_b = set()
+        fused = []
+
+        for pa in peaks_a:
+            # Find closest peak in B within tolerance
+            dists = np.abs(peaks_b - pa)
+            nearest_idx = int(np.argmin(dists))
+            if dists[nearest_idx] <= tol_samples:
+                pb = peaks_b[nearest_idx]
+                matched_b.add(nearest_idx)
+                # Keep whichever has higher amplitude
+                keep = pa if amp(sig_a, pa) >= amp(sig_b, pb) else pb
+                fused.append(keep)
+            else:
+                fused.append(pa)
+
+        # Add unmatched B peaks
+        for j, pb in enumerate(peaks_b):
+            if j not in matched_b:
+                fused.append(int(pb))
+
+        fused = np.array(sorted(set(fused)), dtype=int)
+
+        # Final de-duplication: if two peaks are within tol, keep higher-amp one
+        if len(fused) < 2:
+            return fused
+        keep_mask = np.ones(len(fused), dtype=bool)
+        for i in range(len(fused) - 1):
+            if not keep_mask[i]:
+                continue
+            if fused[i + 1] - fused[i] <= tol_samples:
+                amp_i   = amp(sig_a, fused[i])
+                amp_ip1 = amp(sig_a, fused[i + 1])
+                if amp_i >= amp_ip1:
+                    keep_mask[i + 1] = False
+                else:
+                    keep_mask[i] = False
+        return fused[keep_mask]
+
     def run_with_ablation(self, recording):
         self._log("Running ablation study...")
         fs       = recording["fs"]
@@ -476,8 +1104,12 @@ class PHASEPipeline:
         fdir = Path(figures_dir)
         fdir.mkdir(parents=True, exist_ok=True)
 
+        # Use raw abdomen signal from `recording` when available; otherwise
+        # fall back to the preprocessed signal so figure saving doesn't fail
+        # when callers pass a minimal recording dict (see _run_tail usage).
+        raw_abd = recording.get("abdomen", abd_proc)
         plot_preprocessing(
-            recording["abdomen"][0], abd_proc[0], self.fs,
+            raw_abd[0], abd_proc[0], self.fs,
             save_path=str(fdir / f"{rec_id}_preprocessing.png"))
 
         plot_maternal_cancellation(
