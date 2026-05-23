@@ -1,0 +1,7 @@
+method,n_recordings,Se_mean,Se_std,PPV_mean,PPV_std,F1_mean,F1_std,FHR_MAE_mean,FHR_MAE_std,results_csv
+PHASE (original),5,91.01,3.362,97.567,1.608,94.144,2.122,8.39,3.446,results_original_adfecgdb\results_20260521_063034.csv
+PHASE-SEQ,5,56.53,32.276,60.392,30.418,58.304,31.47,20.114,13.718,results_sequential_adfecgdb\results_20260521_064713.csv
+PHASE-ENS-SIMPLE,5,79.111,18.836,82.736,16.934,80.848,17.935,12.139,7.936,results_ensemble_simple_adfecgdb\results_20260521_070831.csv
+PHASE-ENS-WEIGHTED,5,77.203,20.935,80.866,19.35,78.956,20.177,12.696,8.43,results_ensemble_weighted_adfecgdb\results_20260521_072538.csv
+PHASE-RESCUE,5,53.475,32.105,57.162,30.544,55.177,31.429,20.72,13.258,results_rescue_adfecgdb\results_20260521_074259.csv
+PHASE-PEAK-FUSION,5,94.559,3.547,74.641,16.43,82.692,11.119,46.724,31.855,results_peak_fusion_adfecgdb\results_20260521_080104.csv

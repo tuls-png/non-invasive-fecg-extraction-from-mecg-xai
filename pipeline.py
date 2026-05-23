@@ -829,20 +829,38 @@ class PHASEPipeline:
 
         duration  = recording.get("duration_sec", recording["abdomen"].shape[1] / fs)
         min_peaks = _min_usable_peaks(duration, cfg, recording.get("dataset", "ADFECGDB"))
-        rescue_threshold = int(min_peaks * getattr(cfg, "RESCUE_THRESHOLD_FRAC", 0.6))
+        rescue_threshold = int(min_peaks * getattr(cfg, "RESCUE_THRESHOLD_FRAC", 0.85))
+        ibi_cv_max = getattr(cfg, "RESCUE_IBI_CV_MAX", 0.30)
 
-        a_strong = s["a_valid"] and len(s["a_peaks"]) >= rescue_threshold
+        # Check 1: Path A passed HR filter and found enough peaks
+        a_enough_peaks = s["a_valid"] and len(s["a_peaks"]) >= rescue_threshold
+
+        # Check 2: Path A peaks are rhythmically regular (low IBI coefficient
+        # of variation). Spurious peaks from noise have high IBI variance.
+        if len(s["a_peaks"]) >= 4:
+            ibis   = np.diff(s["a_peaks"]).astype(float)
+            ibi_cv = float(np.std(ibis) / (np.mean(ibis) + 1e-10))
+        else:
+            ibi_cv = float("inf")
+        a_regular = ibi_cv <= ibi_cv_max
+
+        a_strong = a_enough_peaks and a_regular
+
+        self._log(f"  Path A: {len(s['a_peaks'])} peaks (need {rescue_threshold}), "
+                  f"valid={s['a_valid']}, IBI_CV={ibi_cv:.3f} (max {ibi_cv_max})")
 
         if a_strong:
             chosen_sig, chosen_peaks = s["a_sig"], s["a_peaks"]
             chosen_path = f"RESCUE_used_A_IC{s['a_idx']+1}_{s['a_hr']:.0f}bpm"
-            self._log(f"  Path A strong ({len(s['a_peaks'])} peaks >= {rescue_threshold}) "
-                      f"→ using Path A, Path B skipped")
+            self._log(f"  Path A strong → using Path A, Path B skipped")
         else:
+            reason = []
+            if not s["a_valid"]:    reason.append("HR invalid")
+            if not a_enough_peaks:  reason.append(f"too few peaks ({len(s['a_peaks'])} < {rescue_threshold})")
+            if not a_regular:       reason.append(f"irregular IBI (CV={ibi_cv:.3f} > {ibi_cv_max})")
             chosen_sig, chosen_peaks = s["b_sig"], s["b_peaks"]
             chosen_path = f"RESCUE_used_B_IC{s['b_idx']+1}_{s['b_hr']:.0f}bpm"
-            self._log(f"  Path A weak ({len(s['a_peaks'])} peaks, valid={s['a_valid']}) "
-                      f"→ Path B rescue activated")
+            self._log(f"  Path A weak [{', '.join(reason)}] → Path B rescue activated")
 
         return self._run_tail(s, chosen_sig, chosen_peaks,
                               chosen_path, "PHASE-RESCUE",
@@ -881,11 +899,15 @@ class PHASEPipeline:
         b_peaks_det = detect_fetal_qrs(s["b_sig"], fs, cfg=cfg)
         self._log(f"  Path A peaks: {len(a_peaks_det)} | Path B peaks: {len(b_peaks_det)}")
 
-        # Merge peak lists
+        # Strict merge — amplitude + IBI guards filter false positives
         tol_samples = int(getattr(cfg, "EVAL_TOLERANCE_MS", 50) * fs / 1000)
         fused_peaks = self._merge_peak_lists(
-            s["a_sig"], s["b_sig"], a_peaks_det, b_peaks_det, tol_samples)
-        self._log(f"  Fused peaks: {len(fused_peaks)}")
+            s["a_sig"], s["b_sig"], a_peaks_det, b_peaks_det, tol_samples,
+            amp_thresh_frac=getattr(cfg, "PEAK_FUSION_AMP_THRESH", 0.4),
+            fs=fs)
+        self._log(f"  Path A: {len(a_peaks_det)} peaks | "
+                  f"Path B: {len(b_peaks_det)} peaks | "
+                  f"Fused (strict): {len(fused_peaks)} peaks")
 
         # Confidence-weighted signal for EKF waveform (not for QRS detection)
         a_hr_score = _hr_score(s["a_hr"], cfg, s["expected_fhr"])
@@ -952,65 +974,129 @@ class PHASEPipeline:
         }
 
     @staticmethod
-    def _merge_peak_lists(sig_a, sig_b, peaks_a, peaks_b, tol_samples):
+    def _merge_peak_lists(sig_a, sig_b, peaks_a, peaks_b, tol_samples,
+                          amp_thresh_frac=0.4, min_ibi_samples=None, fs=None):
         """
-        Merge two QRS peak lists using a tolerance window.
+        Strict peak-list merge.
 
-        For each peak in A, look for a matching peak in B within tol_samples.
-        - Match found → keep the one with higher local signal amplitude.
-        - No match → keep the A peak (uncontested).
-        Remaining unmatched B peaks are added (uncontested).
-        Final list is sorted and de-duplicated within tol_samples.
+        MATCHED peaks (both paths agree within tol_samples):
+          → Always kept. Use the one with higher local amplitude.
+
+        UNMATCHED peaks (only one path detected it):
+          → Kept ONLY if they pass both guards:
+            1. Amplitude guard: local amplitude >= amp_thresh_frac * median
+               amplitude of all matched peaks. Weak unmatched peaks are
+               almost always ICA noise, not real fetal beats.
+            2. IBI guard: the peak must not create a beat-to-beat interval
+               shorter than min_ibi_samples (default: 60s/220bpm * fs).
+               Physiologically impossible intervals are false positives.
+
+        This directly fixes the over-detection problem where Path B adds
+        many spurious peaks on recordings where Path A is already correct.
+        On hard recordings where Path B finds real beats that Path A missed,
+        those peaks have strong amplitude and valid IBIs — they pass both
+        guards and are kept, preserving the fusion benefit.
+
+        Parameters
+        ----------
+        amp_thresh_frac : float
+            Unmatched peak amplitude must be >= this fraction of the median
+            matched-peak amplitude. Default 0.4 (40%).
+        min_ibi_samples : int or None
+            Minimum allowed gap between consecutive fused peaks in samples.
+            If None, derived from fs at 220 BPM (physiological ceiling).
+        fs : float or None
+            Sampling frequency. Used only to derive min_ibi_samples if not
+            provided explicitly.
         """
         if len(peaks_a) == 0:
             return peaks_b.copy() if len(peaks_b) > 0 else np.array([], dtype=int)
         if len(peaks_b) == 0:
             return peaks_a.copy()
 
-        n = max(len(sig_a), len(sig_b))
+        # Minimum IBI: beats cannot be closer than 60/220 BPM seconds apart
+        if min_ibi_samples is None:
+            min_ibi_samples = int((60.0 / 220.0) * fs) if fs else 10
 
         def amp(sig, idx):
             lo = max(0, idx - 5)
             hi = min(len(sig), idx + 6)
             return float(np.max(np.abs(sig[lo:hi])))
 
-        matched_b = set()
-        fused = []
+        # --- Pass 1: match peaks across paths within tolerance ---------------
+        matched_b   = set()
+        matched_a   = set()
+        fused       = []
+        matched_amps = []
 
-        for pa in peaks_a:
-            # Find closest peak in B within tolerance
+        for i, pa in enumerate(peaks_a):
             dists = np.abs(peaks_b - pa)
             nearest_idx = int(np.argmin(dists))
             if dists[nearest_idx] <= tol_samples:
                 pb = peaks_b[nearest_idx]
                 matched_b.add(nearest_idx)
-                # Keep whichever has higher amplitude
-                keep = pa if amp(sig_a, pa) >= amp(sig_b, pb) else pb
+                matched_a.add(i)
+                # Keep the one with higher local amplitude
+                amp_a = amp(sig_a, pa)
+                amp_b = amp(sig_b, pb)
+                keep  = pa if amp_a >= amp_b else pb
                 fused.append(keep)
-            else:
+                matched_amps.append(max(amp_a, amp_b))
+
+        # Amplitude reference: median of matched peaks (robust to outliers)
+        if matched_amps:
+            amp_ref = float(np.median(matched_amps))
+        else:
+            # No matched peaks at all — fall back to median of all Path A amps
+            amp_ref = float(np.median([amp(sig_a, p) for p in peaks_a])) + 1e-10
+
+        amp_threshold = amp_thresh_frac * amp_ref
+
+        # --- Pass 2: add unmatched Path A peaks (with guards) ---------------
+        for i, pa in enumerate(peaks_a):
+            if i in matched_a:
+                continue
+            if amp(sig_a, pa) >= amp_threshold:
                 fused.append(pa)
+            # else: drop — weak unmatched A peak, likely noise
 
-        # Add unmatched B peaks
+        # --- Pass 3: add unmatched Path B peaks (with guards) ---------------
         for j, pb in enumerate(peaks_b):
-            if j not in matched_b:
+            if j in matched_b:
+                continue
+            if amp(sig_b, pb) >= amp_threshold:
                 fused.append(int(pb))
+            # else: drop — this is the main source of false positives
 
+        # --- Sort and apply IBI guard ----------------------------------------
         fused = np.array(sorted(set(fused)), dtype=int)
 
-        # Final de-duplication: if two peaks are within tol, keep higher-amp one
         if len(fused) < 2:
             return fused
+
+        # Remove peaks that create physiologically impossible short intervals
         keep_mask = np.ones(len(fused), dtype=bool)
-        for i in range(len(fused) - 1):
-            if not keep_mask[i]:
-                continue
-            if fused[i + 1] - fused[i] <= tol_samples:
-                amp_i   = amp(sig_a, fused[i])
-                amp_ip1 = amp(sig_a, fused[i + 1])
-                if amp_i >= amp_ip1:
-                    keep_mask[i + 1] = False
+        for i in range(1, len(fused)):
+            if not keep_mask[i - 1]:
+                # Find last kept peak before i
+                prev_kept = -1
+                for k in range(i - 1, -1, -1):
+                    if keep_mask[k]:
+                        prev_kept = fused[k]
+                        break
+                if prev_kept < 0:
+                    continue
+                ibi = fused[i] - prev_kept
+            else:
+                ibi = fused[i] - fused[i - 1]
+
+            if ibi < min_ibi_samples:
+                # Keep whichever of the two has higher amplitude (on sig_a)
+                if amp(sig_a, fused[i]) > amp(sig_a, fused[i - 1]):
+                    keep_mask[i - 1] = False
                 else:
                     keep_mask[i] = False
+
         return fused[keep_mask]
 
     def run_with_ablation(self, recording):
@@ -1104,12 +1190,8 @@ class PHASEPipeline:
         fdir = Path(figures_dir)
         fdir.mkdir(parents=True, exist_ok=True)
 
-        # Use raw abdomen signal from `recording` when available; otherwise
-        # fall back to the preprocessed signal so figure saving doesn't fail
-        # when callers pass a minimal recording dict (see _run_tail usage).
-        raw_abd = recording.get("abdomen", abd_proc)
         plot_preprocessing(
-            raw_abd[0], abd_proc[0], self.fs,
+            recording["abdomen"][0], abd_proc[0], self.fs,
             save_path=str(fdir / f"{rec_id}_preprocessing.png"))
 
         plot_maternal_cancellation(

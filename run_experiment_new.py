@@ -32,6 +32,7 @@ from configs import get_config
 from dataset_handlers import get_dataset
 from pipeline import PHASEPipeline
 from evaluation.metrics import aggregate_results, wilcoxon_test
+from evaluation.nifecgdb_evaluator import NIFECGDBEvaluator
 from utils.logger import ResultsLogger
 from utils.visualization import plot_ablation_results, plot_sota_comparison
 
@@ -93,6 +94,10 @@ def run_method_on_dataset(method, dataset_name, data_dir,
     pipe    = PHASEPipeline(verbose=True, dataset=dataset_name)
     runner  = _get_runner(pipe, method)
     logger  = ResultsLogger(f"results_{method}_{dataset_name}")
+    nifecgdb_evaluator = (
+        NIFECGDBEvaluator(method=method)
+        if dataset_name == "nifecgdb" else None
+    )
     all_metrics = []
 
     for rec in recordings:
@@ -106,6 +111,18 @@ def run_method_on_dataset(method, dataset_name, data_dir,
             logger.log_recording(
                 rec["recording"], label, result["metrics"])
             all_metrics.append(result["metrics"])
+
+            if nifecgdb_evaluator is not None:
+                try:
+                    nifecgdb_evaluator.run_all_checks(
+                        rec["recording"], rec,
+                        result["maternal_peaks"],
+                        result["residual"],
+                        result["fetal_peaks"]
+                    )
+                except Exception as e:
+                    print(f"[NIFECGDB] Validation failed for {rec['recording']}: {e}")
+                    import traceback; traceback.print_exc()
         except Exception as e:
             print(f"[ERROR] {rec['recording']}: {e}")
             import traceback; traceback.print_exc()
@@ -116,6 +133,8 @@ def run_method_on_dataset(method, dataset_name, data_dir,
     print("=" * 70)
     aggregate_results(all_metrics)
     csv_path, _ = logger.save()
+    if nifecgdb_evaluator is not None:
+        nifecgdb_evaluator.save()
     return all_metrics, csv_path
 
 

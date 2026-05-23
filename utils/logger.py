@@ -79,7 +79,8 @@ class ResultsLogger:
         csv_path  = self.results_dir / f"results_{self.timestamp}.csv"
         json_path = self.results_dir / f"results_{self.timestamp}.json"
 
-        # CSV
+        # Ensure the results directory exists before saving.
+        self.results_dir.mkdir(parents=True, exist_ok=True)
         fieldnames = list(self.records[0].keys())
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -91,8 +92,8 @@ class ResultsLogger:
             json.dump(self.records, f, indent=2, default=str)
 
         print(f"[Logger] Saved {len(self.records)} records to:")
-        print(f"  CSV  → {csv_path}")
-        print(f"  JSON → {json_path}")
+        print(f"  CSV  -> {csv_path}")
+        print(f"  JSON -> {json_path}")
 
         return str(csv_path), str(json_path)
 
