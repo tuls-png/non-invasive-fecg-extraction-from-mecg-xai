@@ -26,3 +26,7 @@ bandpass_low: 5.0
 
 # FIX 6: Lower PT_THRESHOLD_FACTOR to recover weak fetal beats post-subtraction
 pt_threshold_factor: 0.5
+# ICA dual-contrast: run both logcosh and exp, pick whichever gives
+# a better maternal IC score. Addresses CinC2013's wide quality range
+# where no single contrast function works universally.
+ica_dual_contrast: true

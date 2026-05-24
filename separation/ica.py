@@ -378,3 +378,102 @@ def get_ic_as_signal(ICs: np.ndarray, idx: int) -> np.ndarray:
     ic = ic - np.mean(ic)
     ic = ic / (np.std(ic) + 1e-10)
     return ic
+
+def run_ica_best_contrast(signals: np.ndarray,
+                          n_components: int = ICA_N_COMPONENTS,
+                          fs: int = FS) -> tuple[np.ndarray, object, str]:
+    """
+    Run FastICA twice — once with 'logcosh', once with 'exp' — and return
+    whichever decomposition produces a better maternal IC identification.
+
+    WHY:
+      logcosh is optimal for strong super-Gaussian signals (maternal ECG on
+      clean recordings). exp is more robust to weak/mixed-kurtosis signals
+      (faint fetal ECG on hard recordings, but destabilises maternal IC
+      identification on easy recordings). Neither dominates universally across
+      CinC2013's quality range. Running both and selecting adaptively gives the
+      best of both contrast functions without any manual tuning.
+
+    SCORING:
+      The winner is decided by score_maternal_ic() on the selected maternal IC
+      from each decomposition. A higher maternal IC score means:
+        - More regular heartbeat detected
+        - More complete peak set found
+        - Higher kurtosis (sharper QRS spikes)
+      These together indicate ICA found a clean, correct maternal component.
+      The decomposition where ICA was most confident about the maternal signal
+      is the one where separation quality was highest overall.
+
+    Parameters
+    ----------
+    signals      : (n_channels, n_samples) multichannel abdominal signal
+    n_components : number of ICA components to extract
+    fs           : sampling frequency
+
+    Returns
+    -------
+    ICs          : (n_components, n_samples) independent components
+    ica_obj      : fitted FastICA object (winner)
+    winner       : 'logcosh' or 'exp' — which contrast function won
+    """
+    results = {}
+
+    for fun in ('logcosh', 'exp'):
+        try:
+            variances   = np.var(signals, axis=1)
+            active_mask = variances > 1e-10
+            active_idx  = np.where(active_mask)[0]
+            n_active    = len(active_idx)
+
+            if n_active == 0:
+                raise ValueError("All channels have zero variance.")
+
+            active_signals = signals[active_idx]
+            n_comp_actual  = min(n_components, n_active)
+
+            ica = FastICA(
+                n_components=n_comp_actual,
+                max_iter=ICA_MAX_ITER,
+                random_state=ICA_RANDOM_STATE,
+                tol=ICA_TOL,
+                whiten='arbitrary-variance',
+                fun=fun,
+            )
+            ICs_active = ica.fit_transform(active_signals.T).T
+
+            if n_comp_actual < n_components:
+                N   = signals.shape[1]
+                ICs = np.zeros((n_components, N), dtype=ICs_active.dtype)
+                ICs[:n_comp_actual] = ICs_active
+            else:
+                ICs = ICs_active
+
+            # Score this decomposition by maternal IC quality
+            mat_idx, mat_scores = select_maternal_ic(ICs, fs)
+            mat_score = mat_scores[mat_idx]
+
+            results[fun] = dict(ICs=ICs, ica=ica, mat_score=mat_score,
+                                mat_idx=mat_idx)
+            print(f"[ICA-DUAL] fun='{fun}': maternal IC{mat_idx+1} "
+                  f"score={mat_score:.4f}")
+
+        except Exception as e:
+            print(f"[ICA-DUAL] fun='{fun}' failed: {e}")
+            results[fun] = None
+
+    # Pick winner — higher maternal IC score wins
+    logcosh_score = results['logcosh']['mat_score'] if results.get('logcosh') else -1
+    exp_score     = results['exp']['mat_score']     if results.get('exp')     else -1
+
+    if logcosh_score >= exp_score and results.get('logcosh'):
+        winner = 'logcosh'
+    elif results.get('exp'):
+        winner = 'exp'
+    else:
+        raise RuntimeError("[ICA-DUAL] Both contrast functions failed.")
+
+    best = results[winner]
+    print(f"[ICA-DUAL] Winner: '{winner}' "
+          f"(logcosh={logcosh_score:.4f} vs exp={exp_score:.4f})")
+
+    return best['ICs'], best['ica'], winner
