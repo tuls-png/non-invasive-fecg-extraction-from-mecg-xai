@@ -5,6 +5,16 @@ Novel Adaptive Windowed Weighted SVD (AW-WSVD) for maternal ECG cancellation.
 FIX: Removed two duplicate function bodies that appeared after the first
 return statement in adaptive_windowed_wsvd. Only the most complete version
 (with per-channel subtraction gating and energy protection) is kept.
+
+NEW FEATURES:
+  [NEW-4] Dataset-adaptive WSVD window length: adaptive_windowed_wsvd() now
+          accepts an optional `window_sec` override parameter so the pipeline
+          can pass a shorter window for CinC2013 (2-3 s instead of 5 s).
+          Shorter windows give more stable per-window SVD estimates on the
+          short, noisy CinC2013 recordings without touching the global default.
+          The module-level WSVD_WINDOW_SEC_CINC constant defines the default
+          CinC2013 override. The pipeline selects which value to pass based on
+          recording dataset.
 """
 
 import numpy as np
@@ -21,6 +31,10 @@ WSVD_N_COMPONENTS = _cfg.WSVD_N_COMPONENTS
 WSVD_COMPONENT_CORR_THRESH = _cfg.WSVD_COMPONENT_CORR_THRESH
 WSVD_MAX_ENERGY_REMOVAL = _cfg.WSVD_MAX_ENERGY_REMOVAL
 WSVD_CHANNEL_R2_MIN = _cfg.WSVD_CHANNEL_R2_MIN
+
+# [NEW-4] Shorter window for CinC2013 — improves SVD stability on short recordings
+WSVD_WINDOW_SEC_CINC = 2.5   # seconds; original default is 5 s
+
 
 def gaussian_weight_matrix(n_samples: int, qrs_peaks: np.ndarray,
                             fs: int = FS,
@@ -64,7 +78,8 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
                             mat_ic: np.ndarray = None,
                             n_components: int = WSVD_N_COMPONENTS,
                             corr_thresh: float = WSVD_COMPONENT_CORR_THRESH,
-                            channel_r2: np.ndarray = None) -> np.ndarray:
+                            channel_r2: np.ndarray = None,
+                            window_sec: float = None) -> np.ndarray:
     """
     Adaptive Windowed WSVD with per-window maternal correlation validation
     and per-channel subtraction gating.
@@ -87,13 +102,20 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
     n_components: max SVD components to consider per window
     corr_thresh : minimum |correlation| to accept component as maternal
     channel_r2  : (n_ch,) maternal IC R^2 per channel
+    window_sec  : [NEW-4] override window length in seconds. If None, uses
+                  the module-level WSVD_WINDOW_SEC default. Pass
+                  WSVD_WINDOW_SEC_CINC (2.5 s) for CinC2013 recordings to
+                  improve SVD stability on short noisy signals.
 
     Returns
     -------
     recon : (n_ch, N) reconstructed maternal signal
     """
+    # [NEW-4] Use caller-supplied window or fall back to module default
+    effective_window_sec = window_sec if window_sec is not None else WSVD_WINDOW_SEC
+
     n_ch, N = abd.shape
-    win_len = int(WSVD_WINDOW_SEC * fs)
+    win_len = int(effective_window_sec * fs)
     hop     = int(win_len * (1.0 - WSVD_OVERLAP))
     H       = np.hanning(win_len)
 
@@ -171,7 +193,7 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
     recon[:, nonzero] /= weight_pad[None, nonzero]
 
     print(f"[AW-WSVD] Processed {win_count} windows "
-          f"(window={WSVD_WINDOW_SEC}s, overlap={WSVD_OVERLAP*100:.0f}%, "
+          f"(window={effective_window_sec}s, overlap={WSVD_OVERLAP*100:.0f}%, "
           f"components={n_components}, corr_thresh={corr_thresh})")
     if skipped_count > 0:
         pct = 100 * skipped_count / (win_count + 1e-8)
