@@ -23,6 +23,10 @@ DISSERTATION MODIFICATIONS (unified, dataset-adaptive):
           suppressed maternal content). morphology_score = mean pairwise
           correlation of beat windows, gated on min peak count.
   [MOD-2] determine_n_components(): PCA-adaptive n_components before each ICA
+  [FIX-2] PCA floor raised from 2 to 3: minimum 3 components ensures ICA
+          can separate maternal/fetal/noise as three distinct sources.
+  [FIX-1] Stability-gated ensemble selection: winning IC must appear as
+          top scorer in >= 2 seeds. Falls back to seed=42 if no stable IC.
           call. Counts components explaining ≥5% variance, clipped to [2,4].
           Applied independently to ICA1 (on abd_proc) and ICA2 (on residual).
   [MOD-3] ICA ensemble in _best_ic(): N_ENSEMBLE=5 runs with fixed seeds 0–4.
@@ -65,7 +69,11 @@ from preprocessing.qrs_detector import load_wfdb_annotation
 N_ENSEMBLE = 5          # number of ICA runs per ensemble call (seeds 0 … N-1)
 ENSEMBLE_SEEDS = list(range(N_ENSEMBLE))   # [0, 1, 2, 3, 4] — fixed for reproducibility
 PCA_VARIANCE_THRESHOLD = 0.05   # components explaining ≥ 5% variance are kept
-PCA_N_MIN, PCA_N_MAX  = 2, 4   # clip range for adaptive n_components
+PCA_N_MIN, PCA_N_MAX  = 3, 4   # clip range for adaptive n_components
+                                # Floor raised 2→3: with only 2 components
+                                # ICA cannot separate maternal/fetal/noise
+                                # as three distinct sources. 3 is the minimum
+                                # meaningful decomposition for this problem.
 MORPHOLOGY_MIN_PEAKS  = 5       # minimum peaks to compute morphology score
 MORPHOLOGY_WIN_SEC    = 0.3     # ± seconds around each peak for beat window
 STABILITY_LOG_THRESH  = 0.7     # cross-run corr above this is logged as "stable"
@@ -541,7 +549,50 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
         print(f"[ENSEMBLE] {label}: no candidate passed HR filter "
               f"-- selecting by unified score across all candidates")
 
-    best = max(pool, key=lambda c: c["unified"])
+    # ── [FIX-1] Stability-gated selection ──────────────────────────────────────
+    # Require winning IC to appear as top scorer in >= ENSEMBLE_MIN_WINS seeds.
+    # An IC that only wins in 1 seed is likely a noise artefact from that
+    # initialisation. An IC that consistently scores highest across multiple
+    # seeds is the genuine fetal signal. This protects recordings where the
+    # original single-seed ICA was already correct — that IC will consistently
+    # win across seeds on easy recordings.
+    ENSEMBLE_MIN_WINS = 2   # minimum seeds in which IC must be top scorer
+
+    # Count how many seeds each candidate's (ic_idx) appears as top scorer
+    top_by_seed = {}
+    for c in pool:
+        s = c["seed"]
+        if s not in top_by_seed or c["unified"] > top_by_seed[s]["unified"]:
+            top_by_seed[s] = c
+
+    # Count wins per ic_idx
+    win_counts = {}
+    for seed_winner in top_by_seed.values():
+        key = seed_winner["ic_idx"]
+        win_counts[key] = win_counts.get(key, 0) + 1
+
+    # Filter candidates to those whose ic_idx won in >= ENSEMBLE_MIN_WINS seeds
+    stable_pool = [c for c in pool if win_counts.get(c["ic_idx"], 0) >= ENSEMBLE_MIN_WINS]
+
+    if stable_pool:
+        best = max(stable_pool, key=lambda c: c["unified"])
+        if label:
+            print(f"[ENSEMBLE-STABLE] {label}: ic_idx={best['ic_idx']} "
+                  f"won in {win_counts[best['ic_idx']]}/{len(ENSEMBLE_SEEDS)} seeds")
+    else:
+        # Fallback: no IC won in >= ENSEMBLE_MIN_WINS seeds
+        # Use original single-seed (seed=42) result if available, else global max
+        seed42_pool = [c for c in pool if c["seed"] == 42]
+        if seed42_pool:
+            best = max(seed42_pool, key=lambda c: c["unified"])
+            if label:
+                print(f"[ENSEMBLE-FALLBACK] {label}: no stable IC found "
+                      f"-- using seed=42 result")
+        else:
+            best = max(pool, key=lambda c: c["unified"])
+            if label:
+                print(f"[ENSEMBLE-FALLBACK] {label}: no stable IC, no seed=42 "
+                      f"-- using global max")
 
     if label:
         ann_note = f" [ann~{centre:.0f}]" if expected_hr is not None else ""
