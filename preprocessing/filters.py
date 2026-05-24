@@ -33,14 +33,30 @@ MEDFILT_KERNEL = _cfg.MEDFILT_KERNEL
 
 
 def bandpass_filter(signal: np.ndarray, fs: int = FS,
-                    lowcut: float = BANDPASS_LOW,
-                    highcut: float = BANDPASS_HIGH,
-                    order: int = BANDPASS_ORDER) -> np.ndarray:
+                    lowcut: float = None,
+                    highcut: float = None,
+                    order: int = None,
+                    cfg: BaseConfig = None) -> np.ndarray:
     """
     Zero-phase Butterworth bandpass filter.
     Uses filtfilt (forward-backward) to eliminate phase distortion,
     which is critical for preserving QRS morphology.
     """
+    if cfg is None:
+        if lowcut is None:
+            lowcut = BANDPASS_LOW
+        if highcut is None:
+            highcut = BANDPASS_HIGH
+        if order is None:
+            order = BANDPASS_ORDER
+    else:
+        if lowcut is None:
+            lowcut = cfg.BANDPASS_LOW
+        if highcut is None:
+            highcut = cfg.BANDPASS_HIGH
+        if order is None:
+            order = cfg.BANDPASS_ORDER
+
     nyq  = 0.5 * fs
     low  = lowcut  / nyq
     high = highcut / nyq
@@ -94,7 +110,8 @@ def scale_signal(signal: np.ndarray) -> np.ndarray:
     return signal / std
 
 
-def preprocess_channel(signal: np.ndarray, fs: int = FS) -> np.ndarray:
+def preprocess_channel(signal: np.ndarray, fs: int = FS,
+                        cfg: BaseConfig = None) -> np.ndarray:
     """
     Apply full preprocessing chain to a single channel.
 
@@ -109,12 +126,13 @@ def preprocess_channel(signal: np.ndarray, fs: int = FS) -> np.ndarray:
     ----------
     signal : (N,) raw ECG channel
     fs     : sampling rate in Hz
+    cfg    : BaseConfig, optional dataset-specific override
 
     Returns
     -------
     (N,) preprocessed signal, zero-mean, original variance preserved
     """
-    s = bandpass_filter(signal, fs)
+    s = bandpass_filter(signal, fs, cfg=cfg)
     s = notch_filter(s, fs)
     s = median_filter(s)
     s = center_signal(s)
@@ -122,19 +140,21 @@ def preprocess_channel(signal: np.ndarray, fs: int = FS) -> np.ndarray:
     return s
 
 
-def preprocess_multichannel(signals: np.ndarray, fs: int = FS) -> np.ndarray:
+def preprocess_multichannel(signals: np.ndarray, fs: int = FS,
+                            cfg: BaseConfig = None) -> np.ndarray:
     """
     Preprocess all channels independently.
 
     Parameters
     ----------
     signals : (n_channels, N)
+    cfg     : BaseConfig, optional dataset-specific override
 
     Returns
     -------
     (n_channels, N) preprocessed
     """
-    return np.array([preprocess_channel(ch, fs) for ch in signals])
+    return np.array([preprocess_channel(ch, fs, cfg=cfg) for ch in signals])
 
 
 def normalize_for_display(signal: np.ndarray) -> np.ndarray:

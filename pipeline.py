@@ -14,28 +14,30 @@ CHANGES FROM ORIGINAL:
   [FIX-3] ECHO has_reference passed explicitly; None passed for NIFECGDB so
           morphology score is disabled rather than self-referential.
 
-NEW FEATURES (dissertation improvements):
-  [NEW-1] ICA ensemble with consensus scoring (Points 1+2+3 from spec):
-          - Step 2 and Step 8 now use run_ica_ensemble() + pca_n_components()
-          - PCA pre-screens the number of components per recording/path
-          - Ensemble of N=ICA_ENSEMBLE_RUNS runs covers initialisation instability
-          - select_best_ic_from_ensemble() applies three-factor scoring across
-            all N x k candidates and picks the global best
-  [NEW-2] PCA pre-screening (Point 2): pca_n_components() determines n_components
-          per path from the data's own variance structure. The only cap is
-          n_active_channels — the mathematical limit of ICA. No dataset-specific
-          overrides are applied; the 5% variance threshold does all filtering.
-  [NEW-3] Three-factor IC scoring (Point 3): score_fetal_ic_three_factor()
-          replaces the original n_peaks * hr_score ranking in _best_ic().
-          base × penalty (harmonic at 2×maternal_HR) × morphology_boost.
-          _best_ic() is retained only for the ablation study.
-  [NEW-4] Dataset-adaptive WSVD window (Point 4): Step 6 passes
-          window_sec=WSVD_WINDOW_SEC_CINC for CinC2013 recordings.
+DISSERTATION MODIFICATIONS (unified, dataset-adaptive):
+  [MOD-1] _best_ic(): unified three-factor scoring replaces n_peaks × hr_score.
+          final_score = base_score × maternal_penalty × (1 + morphology_score)
+          score_fetal_ic() is now called inside _best_ic() as the base_score.
+          maternal_penalty uses corr(IC, maternal_IC) and corr(IC, maternal
+          harmonic at 2×mhr). Path B uses half-weight penalty (WSVD already
+          suppressed maternal content). morphology_score = mean pairwise
+          correlation of beat windows, gated on min peak count.
+  [MOD-2] determine_n_components(): PCA-adaptive n_components before each ICA
+          call. Counts components explaining ≥5% variance, clipped to [2,4].
+          Applied independently to ICA1 (on abd_proc) and ICA2 (on residual).
+  [MOD-3] ICA ensemble in _best_ic(): N_ENSEMBLE=5 runs with fixed seeds 0–4.
+          All N×k IC candidates scored with [MOD-1] formula; global winner
+          selected. Not applied to maternal IC selection (already reliable).
+          Stability bonus logged for ECHO (cross-run correlation of top ICs).
+  [MOD-4] adaptive_windowed_wsvd() now receives duration_sec; window length
+          is derived from min_windows=15 floor, capped at WSVD_WINDOW_SEC and
+          floored at 1.5 s. Same code — adaptive behaviour across lengths.
 """
 
 import sys
 import numpy as np
 from pathlib import Path
+from scipy.stats import kurtosis as scipy_kurtosis
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -47,19 +49,26 @@ from preprocessing.qrs_detector import (
     load_adfecgdb_annotation
 )
 from separation.ica import (
-    run_ica, run_ica_ensemble, pca_n_components,
-    select_maternal_ic, select_fetal_ic,
-    select_best_ic_from_ensemble, get_ic_as_signal,
+    run_ica, select_maternal_ic, select_fetal_ic, get_ic_as_signal,
+    score_fetal_ic,
 )
 from separation.wsvd import (
     gaussian_weight_matrix, adaptive_windowed_wsvd,
-    subtract_maternal, svd_explained_variance,
-    WSVD_WINDOW_SEC_CINC,
+    subtract_maternal, svd_explained_variance
 )
 from separation.ekf import FetalECGKalmanFilter
 from evaluation.metrics import evaluate
 from xai.echo import ECHOExplainer
 from preprocessing.qrs_detector import load_wfdb_annotation
+
+# ── Ensemble hyperparameter ──────────────────────────────────────────────────
+N_ENSEMBLE = 5          # number of ICA runs per ensemble call (seeds 0 … N-1)
+ENSEMBLE_SEEDS = list(range(N_ENSEMBLE))   # [0, 1, 2, 3, 4] — fixed for reproducibility
+PCA_VARIANCE_THRESHOLD = 0.05   # components explaining ≥ 5% variance are kept
+PCA_N_MIN, PCA_N_MAX  = 2, 4   # clip range for adaptive n_components
+MORPHOLOGY_MIN_PEAKS  = 5       # minimum peaks to compute morphology score
+MORPHOLOGY_WIN_SEC    = 0.3     # ± seconds around each peak for beat window
+STABILITY_LOG_THRESH  = 0.7     # cross-run corr above this is logged as "stable"
 
 
 def _min_usable_peaks(duration_sec: float, cfg, dataset: str = "ADFECGDB") -> int:
@@ -136,32 +145,230 @@ def _find_maternal_residual_idx(ICs, maternal_ic, cfg):
     return best_idx
 
 
-def _make_maternal_residual_exclude_fn(maternal_ic, corr_thresh):
+# ── [MOD-2] PCA-adaptive n_components ────────────────────────────────────────
+
+def determine_n_components(signals: np.ndarray,
+                            variance_threshold: float = PCA_VARIANCE_THRESHOLD,
+                            n_min: int = PCA_N_MIN,
+                            n_max: int = PCA_N_MAX,
+                            label: str = "") -> int:
     """
-    [NEW-1] Factory: return a callable(ic) -> bool that returns True if `ic`
-    is too correlated with the maternal IC (i.e. should be excluded from
-    Path B ensemble scoring).
+    [MOD-2] Count PCA components that each explain ≥ variance_threshold of
+    total variance, then clip to [n_min, n_max].
+
+    This replaces the fixed cfg.ICA_N_COMPONENTS for both ICA1 and ICA2 calls,
+    making n_components data-driven rather than dataset-specific.
+
+    On clean 5-minute ADFECGDB recordings all four components carry signal
+    (≥ 5% each) → n_components = 4, no behaviour change.
+    On noisy 60-second CinC2013 recordings only 2–3 components clear the
+    threshold → n_components = 2 or 3, reducing the ICA solution space.
+
+    Parameters
+    ----------
+    signals            : (n_ch, N) input signals
+    variance_threshold : minimum fraction of variance per component (default 0.05)
+    n_min, n_max       : clipping range
+    label              : descriptive label for logging
+
+    Returns
+    -------
+    n_components : int in [n_min, n_max]
     """
-    def _exclude(ic):
-        if np.var(ic) < 1e-10:
-            return True
+    try:
+        _, S, _ = np.linalg.svd(signals, full_matrices=False)
+        var_ratio = (S ** 2) / (np.sum(S ** 2) + 1e-12)
+        n_above   = int(np.sum(var_ratio >= variance_threshold))
+        n_comp    = int(np.clip(n_above, n_min, n_max))
+    except Exception:
+        n_comp = n_max
+
+    tag = f" [{label}]" if label else ""
+    print(f"[PCA-ADAPT]{tag} n_components = {n_comp} "
+          f"(components ≥ {variance_threshold*100:.0f}% variance: {n_above if 'n_above' in dir() else '?'})")
+    return n_comp
+
+
+# ── [MOD-1] Unified three-factor IC scoring ───────────────────────────────────
+
+def _morphology_score(sig: np.ndarray, peaks: np.ndarray,
+                      fs: int, win_sec: float = MORPHOLOGY_WIN_SEC) -> float:
+    """
+    [MOD-1] Mean pairwise correlation of beat windows centred on detected peaks.
+
+    Returns 0.0 if fewer than MORPHOLOGY_MIN_PEAKS peaks are found (to avoid
+    degenerate mean from two beats). Higher values indicate consistent QRS
+    morphology across beats — a hallmark of true fetal ECG vs noise ICs.
+    """
+    if len(peaks) < MORPHOLOGY_MIN_PEAKS:
+        return 0.0
+    hw = int(win_sec * fs)
+    N  = len(sig)
+    windows = []
+    for p in peaks:
+        lo, hi = p - hw, p + hw
+        if lo >= 0 and hi <= N:
+            w = sig[lo:hi]
+            w = w / (np.std(w) + 1e-10)
+            windows.append(w)
+    if len(windows) < 2:
+        return 0.0
+    # Sample up to 20 pairs to keep runtime bounded
+    rng   = np.random.default_rng(42)
+    pairs = min(len(windows) * (len(windows) - 1) // 2, 20)
+    corrs = []
+    idx   = list(range(len(windows)))
+    for _ in range(pairs):
+        i, j = rng.choice(idx, size=2, replace=False)
+        n = min(len(windows[i]), len(windows[j]))
+        if n < 4:
+            continue
+        c = float(np.corrcoef(windows[i][:n], windows[j][:n])[0, 1])
+        if np.isfinite(c):
+            corrs.append(abs(c))
+    return float(np.mean(corrs)) if corrs else 0.0
+
+
+def _maternal_penalty(ic: np.ndarray,
+                      maternal_ic: np.ndarray,
+                      maternal_hr: float,
+                      fs: int,
+                      path_b_half_weight: bool = False) -> float:
+    """
+    [MOD-1] Maternal leakage penalty factor.
+
+    penalty = 1 − max(|corr(IC, maternal_IC)|,
+                      |corr(IC, synthetic_maternal_harmonic)|)
+
+    The synthetic harmonic is a sinusoid at 2 × maternal_HR / 60 Hz (i.e. the
+    second harmonic of the maternal R-peak rate), constructed at the same length
+    as the IC. Using np.corrcoef against a synthetic signal is precise and
+    fully reproducible.
+
+    On Path B, WSVD has already suppressed maternal content, so a residual
+    small correlation should not unfairly penalise a valid fetal IC. The penalty
+    is therefore applied at half-weight (×0.5) on Path B, as documented here
+    and in the dissertation. The effective penalty term becomes:
+
+        path_a: penalty = 1 − raw_penalty
+        path_b: penalty = 1 − 0.5 × raw_penalty
+
+    Parameters
+    ----------
+    ic                  : (N,) IC signal (already normalised)
+    maternal_ic         : (N,) maternal IC signal
+    maternal_hr         : maternal heart rate in BPM
+    fs                  : sampling rate
+    path_b_half_weight  : if True, apply penalty at half strength
+
+    Returns
+    -------
+    penalty : float in (0, 1]; 1.0 = no maternal leakage, 0.0 = full leakage
+    """
+    N = len(ic)
+
+    # Correlation with maternal IC
+    try:
+        corr_mat = abs(float(np.corrcoef(ic, maternal_ic)[0, 1]))
+    except Exception:
+        corr_mat = 0.0
+    if not np.isfinite(corr_mat):
+        corr_mat = 0.0
+
+    # Correlation with synthetic second harmonic of maternal rate
+    corr_harm = 0.0
+    if np.isfinite(maternal_hr) and maternal_hr > 0:
+        t = np.arange(N) / fs
+        harmonic = np.sin(2 * np.pi * (2 * maternal_hr / 60.0) * t)
         try:
-            corr = abs(float(np.corrcoef(ic, maternal_ic)[0, 1]))
-            return corr > corr_thresh
+            corr_harm = abs(float(np.corrcoef(ic, harmonic)[0, 1]))
         except Exception:
-            return False
-    return _exclude
+            corr_harm = 0.0
+        if not np.isfinite(corr_harm):
+            corr_harm = 0.0
+
+    raw_penalty = max(corr_mat, corr_harm)
+    weight      = 0.5 if path_b_half_weight else 1.0
+    return float(1.0 - weight * raw_penalty)
 
 
-def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
-             label="", expected_hr=None, min_peaks=100):
+def _score_ic_unified(ic: np.ndarray,
+                      peaks: np.ndarray,
+                      maternal_peaks: np.ndarray,
+                      maternal_ic: np.ndarray,
+                      maternal_hr: float,
+                      fs: int,
+                      path_b: bool = False) -> float:
     """
-    Legacy single-run IC selector. Retained for the ablation study
-    (run_with_ablation). The main pipeline now uses
-    select_best_ic_from_ensemble() with three-factor scoring [NEW-3].
+    [MOD-1] Unified three-factor fetal IC scoring formula:
+
+        final_score = base_score × maternal_penalty × (1 + morphology_score)
+
+    base_score      = score_fetal_ic() — regularity × completeness × (1 + kurtosis)
+    maternal_penalty = 1 − max(|corr(IC, maternal_IC)|, |corr(IC, harmonic)|)
+    morphology_score = mean pairwise beat-window correlation
+
+    Path B flag halves the maternal penalty weight (WSVD already suppressed
+    maternal content; full penalty would unfairly downgrade valid fetal ICs
+    with small residual maternal correlation).
+    """
+    base      = score_fetal_ic(ic, maternal_peaks, fs)
+    mat_pen   = _maternal_penalty(ic, maternal_ic, maternal_hr, fs,
+                                  path_b_half_weight=path_b)
+    morph     = _morphology_score(ic, peaks, fs)
+    return float(base * mat_pen * (1.0 + morph))
+
+
+# ── [MOD-3] Ensemble _best_ic ─────────────────────────────────────────────────
+
+def _best_ic(ICs_or_signals, exclude_idx, maternal_hr, fs, cfg,
+             label="", expected_hr=None, min_peaks=100,
+             maternal_ic=None, maternal_peaks=None,
+             path_b=False,
+             n_components=None):
+    """
+    [MOD-1 + MOD-3] Select the best fetal IC using the unified three-factor
+    score, with ICA ensemble for robustness.
+
+    If `ICs_or_signals` is already decomposed (passed as ICs from outside),
+    ensemble is run by re-running ICA N_ENSEMBLE times on the original mixed
+    signals — but since the pipeline passes pre-computed ICs, the ensemble is
+    integrated at the call sites in run() by passing raw signals when available.
+
+    For backward compatibility with run_with_ablation() which passes pre-computed
+    ICs, this function scores those ICs directly with the three-factor formula
+    (no ensemble re-run, which would require the raw mixed signals).
+
+    The ensemble is invoked via _best_ic_ensemble() in run(), which wraps this
+    function and passes the raw signals explicitly.
+
+    Parameters
+    ----------
+    ICs_or_signals : (n_comp, N) pre-computed ICA components
+    exclude_idx    : IC index to exclude (maternal or residual-maternal)
+    maternal_hr    : maternal heart rate in BPM
+    fs             : sampling rate
+    cfg            : pipeline config
+    label          : logging prefix ("Path A" / "Path B")
+    expected_hr    : prior on fetal HR from annotation (optional)
+    min_peaks      : minimum acceptable detected peaks for a valid candidate
+    maternal_ic    : (N,) maternal IC for maternal penalty (None → penalty = 1)
+    maternal_peaks : (K,) maternal QRS indices for base_score independence
+    path_b         : if True, halve maternal penalty weight (WSVD path)
+    n_components   : ignored here; kept for call-site symmetry
+
+    Returns
+    -------
+    sig, idx, peaks, mean_hr : best IC signal, its index, its peaks, its HR
     """
     centre     = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
+    ICs        = ICs_or_signals
     candidates = []
+
+    _maternal_ic     = maternal_ic if maternal_ic is not None else np.zeros(ICs.shape[1])
+    _maternal_peaks  = maternal_peaks if maternal_peaks is not None else np.array([])
+    _maternal_hr_val = maternal_hr if not np.isnan(maternal_hr) else 75.0
+
     for i, ic in enumerate(ICs):
         if i == exclude_idx:
             continue
@@ -169,21 +376,35 @@ def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
             if label:
                 print(f"[PHASE]   {label} IC{i+1}: skipped (zero-variance pad)")
             continue
+
         sig_norm       = _norm(ic)
         peaks, mean_hr = _candidate_hr(sig_norm, fs, cfg)
         n_peaks        = len(peaks)
         passes_hr      = _is_fetal_hr(mean_hr, maternal_hr, cfg)
         hr_sc          = _hr_score(mean_hr, cfg, expected_hr)
+
+        # [MOD-1] unified three-factor score
+        unified = _score_ic_unified(
+            sig_norm, peaks, _maternal_peaks, _maternal_ic,
+            _maternal_hr_val, fs, path_b=path_b)
+
         candidates.append({
-            "idx": i, "sig": sig_norm, "peaks": peaks,
-            "n_peaks": n_peaks, "mean_hr": mean_hr,
-            "passes_hr": passes_hr, "hr_score": hr_sc,
+            "idx"      : i,
+            "sig"      : sig_norm,
+            "peaks"    : peaks,
+            "n_peaks"  : n_peaks,
+            "mean_hr"  : mean_hr,
+            "passes_hr": passes_hr,
+            "hr_score" : hr_sc,
+            "unified"  : unified,
         })
+
         if label:
             ann_note = f" [ann~{centre:.0f}]" if expected_hr is not None else ""
             print(f"[PHASE]   {label} IC{i+1}: {n_peaks} peaks, "
                   f"HR={mean_hr:.1f} BPM, "
-                  f"fetal_hr={'YES' if passes_hr else 'NO'}{ann_note}")
+                  f"fetal_hr={'YES' if passes_hr else 'NO'}, "
+                  f"unified_score={unified:.4f}{ann_note}")
 
     if not candidates:
         raise ValueError(f"{label}: no usable IC candidates found")
@@ -191,14 +412,175 @@ def _best_ic(ICs, exclude_idx, maternal_hr, fs, cfg,
     valid = [c for c in candidates
              if c["passes_hr"] and c["n_peaks"] >= min_peaks]
     if valid:
-        best = max(valid, key=lambda c: c["n_peaks"] * c["hr_score"])
+        best = max(valid, key=lambda c: c["unified"])
         return best["sig"], best["idx"], best["peaks"], best["mean_hr"]
 
     if label:
         print(f"[PHASE]   {label}: no candidate passed HR filter "
-              f"-- using closest to {centre:.0f} BPM")
-    best = max(candidates, key=lambda c: c["hr_score"])
+              f"-- using closest to {centre:.0f} BPM (by unified score)")
+    best = max(candidates, key=lambda c: c["unified"])
     return best["sig"], best["idx"], best["peaks"], best["mean_hr"]
+
+
+def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
+                      label="", expected_hr=None, min_peaks=100,
+                      maternal_ic=None, maternal_peaks=None,
+                      path_b=False, n_components=None):
+    """
+    [MOD-3] ICA ensemble wrapper for _best_ic.
+
+    Runs FastICA N_ENSEMBLE times with seeds ENSEMBLE_SEEDS (0–4 by default).
+    All N×k IC candidates are scored with the three-factor formula from [MOD-1].
+    The global winner across all runs is returned.
+
+    Reproducibility: seeds are fixed constants (ENSEMBLE_SEEDS), so the same
+    recording always yields the same result. Document N_ENSEMBLE and seeds in
+    the dissertation as explicit hyperparameters.
+
+    Stability bonus (ECHO dimension): After selection, cross-run correlation of
+    top-scoring ICs from different seeds is computed. If mean stability ≥
+    STABILITY_LOG_THRESH it is logged; this value can be fed into ECHO as a
+    fourth attribution dimension (the "stability" dimension). It does NOT affect
+    selection — it is explanatory only.
+
+    Parameters
+    ----------
+    mixed_signals : (n_ch, N) raw mixed signals (e.g. abd_proc or residual)
+    n_components  : number of ICA components per run (from determine_n_components)
+    All other parameters: same as _best_ic.
+
+    Returns
+    -------
+    sig, idx, peaks, mean_hr : best IC, its global candidate index, peaks, HR
+    stability_score          : float, mean cross-run correlation of top candidates
+    """
+    if n_components is None:
+        n_components = PCA_N_MAX
+
+    centre          = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
+    _maternal_ic    = maternal_ic if maternal_ic is not None else np.zeros(mixed_signals.shape[1])
+    _maternal_peaks = maternal_peaks if maternal_peaks is not None else np.array([])
+    _mat_hr         = maternal_hr if (maternal_hr is not None and not np.isnan(maternal_hr)) else 75.0
+
+    all_candidates = []   # list of dicts with run_seed, ic_idx, sig, ...
+
+    for seed in ENSEMBLE_SEEDS:
+        try:
+            from sklearn.decomposition import FastICA
+            from configs import BaseConfig
+            _cfg_base = BaseConfig()
+            ica = FastICA(
+                n_components=n_components,
+                max_iter=_cfg_base.ICA_MAX_ITER,
+                random_state=seed,
+                tol=_cfg_base.ICA_TOL,
+                whiten='arbitrary-variance',
+            )
+            variances   = np.var(mixed_signals, axis=1)
+            active_mask = variances > 1e-10
+            active_sigs = mixed_signals[active_mask]
+            n_active    = active_sigs.shape[0]
+            n_comp_act  = min(n_components, n_active)
+            if n_active == 0:
+                continue
+
+            ica.set_params(n_components=n_comp_act)
+            ICs_active = ica.fit_transform(active_sigs.T).T
+
+            # Pad back to full n_components shape if needed
+            if n_comp_act < n_components:
+                N_sig = mixed_signals.shape[1]
+                ICs   = np.zeros((n_components, N_sig), dtype=ICs_active.dtype)
+                ICs[:n_comp_act] = ICs_active
+            else:
+                ICs = ICs_active
+
+        except Exception as e:
+            print(f"[ENSEMBLE] Seed {seed} ICA failed: {e}")
+            continue
+
+        for i, ic in enumerate(ICs):
+            if i == exclude_idx:
+                continue
+            if np.var(ic) < 1e-10:
+                continue
+
+            sig_norm       = _norm(ic)
+            peaks, mean_hr = _candidate_hr(sig_norm, fs, cfg)
+            n_peaks        = len(peaks)
+            passes_hr      = _is_fetal_hr(mean_hr, maternal_hr, cfg)
+            hr_sc          = _hr_score(mean_hr, cfg, expected_hr)
+            unified        = _score_ic_unified(
+                sig_norm, peaks, _maternal_peaks, _maternal_ic,
+                _mat_hr, fs, path_b=path_b)
+
+            all_candidates.append({
+                "seed"     : seed,
+                "ic_idx"   : i,
+                "sig"      : sig_norm,
+                "peaks"    : peaks,
+                "n_peaks"  : n_peaks,
+                "mean_hr"  : mean_hr,
+                "passes_hr": passes_hr,
+                "hr_score" : hr_sc,
+                "unified"  : unified,
+            })
+
+    if not all_candidates:
+        raise ValueError(f"{label} ensemble: no usable IC candidates found across all seeds")
+
+    if label:
+        print(f"[ENSEMBLE] {label}: {len(all_candidates)} total candidates "
+              f"from {len(ENSEMBLE_SEEDS)} seeds × {n_components} components")
+
+    valid = [c for c in all_candidates
+             if c["passes_hr"] and c["n_peaks"] >= min_peaks]
+    pool  = valid if valid else all_candidates
+
+    if not valid and label:
+        print(f"[ENSEMBLE] {label}: no candidate passed HR filter "
+              f"-- selecting by unified score across all candidates")
+
+    best = max(pool, key=lambda c: c["unified"])
+
+    if label:
+        ann_note = f" [ann~{centre:.0f}]" if expected_hr is not None else ""
+        print(f"[ENSEMBLE] {label} winner: seed={best['seed']}, "
+              f"IC{best['ic_idx']+1}, {best['n_peaks']} peaks, "
+              f"HR={best['mean_hr']:.1f} BPM, "
+              f"unified={best['unified']:.4f}{ann_note}")
+
+    # ── Stability bonus (ECHO fourth dimension, not used for selection) ──────
+    stability_score = 0.0
+    top_per_seed = {}
+    for c in all_candidates:
+        s = c["seed"]
+        if s not in top_per_seed or c["unified"] > top_per_seed[s]["unified"]:
+            top_per_seed[s] = c
+
+    top_sigs = [v["sig"] for v in top_per_seed.values()]
+    if len(top_sigs) >= 2:
+        corrs = []
+        for p in range(len(top_sigs)):
+            for q in range(p + 1, len(top_sigs)):
+                n = min(len(top_sigs[p]), len(top_sigs[q]))
+                try:
+                    c = float(np.corrcoef(top_sigs[p][:n], top_sigs[q][:n])[0, 1])
+                    if np.isfinite(c):
+                        corrs.append(abs(c))
+                except Exception:
+                    pass
+        if corrs:
+            stability_score = float(np.mean(corrs))
+            if stability_score >= STABILITY_LOG_THRESH:
+                print(f"[ENSEMBLE] {label} stability score = {stability_score:.3f} "
+                      f"(≥ {STABILITY_LOG_THRESH} — high cross-run agreement; "
+                      f"candidate for ECHO fourth dimension)")
+            else:
+                print(f"[ENSEMBLE] {label} stability score = {stability_score:.3f} "
+                      f"(< {STABILITY_LOG_THRESH} — moderate cross-run variability)")
+
+    return best["sig"], best["ic_idx"], best["peaks"], best["mean_hr"], stability_score
 
 
 def _refine_peaks_on_smoothed(smoothed, rough_peaks, fs, search_radius_ms=40.0):
@@ -208,7 +590,6 @@ def _refine_peaks_on_smoothed(smoothed, rough_peaks, fs, search_radius_ms=40.0):
         lo  = max(0, p - radius)
         hi  = min(len(smoothed), p + radius)
         window = smoothed[lo:hi]
-        # Use sign of the original peak location to avoid polarity confusion
         if smoothed[p] >= 0:
             local_max = lo + int(np.argmax(window))
         else:
@@ -262,25 +643,19 @@ class PHASEPipeline:
 
         # Step 1: Preprocess
         self._log("Step 1: Preprocessing...")
-        abd_proc = preprocess_multichannel(abd, fs)
-        dir_proc = preprocess_channel(direct, fs) if direct is not None else None
+        abd_proc = preprocess_multichannel(abd, fs, cfg=cfg)
+        dir_proc = preprocess_channel(direct, fs, cfg=cfg) if direct is not None else None
 
-        # Step 2: ICA1 with PCA pre-screening + ensemble [NEW-1, NEW-2]
-        self._log("Step 2: PCA pre-screening + ICA1 ensemble...")
-        n_comp_a = pca_n_components(abd_proc)
-        self._log(f"  PCA → {n_comp_a} components for Path A ICA1")
-        ica1_sets = run_ica_ensemble(abd_proc, n_components=n_comp_a)
-
-        # Use the first run's ICA result for maternal IC selection
-        # (maternal selection uses the standard scorer, not the ensemble scorer)
-        ICs1_primary, _ = run_ica(abd_proc, n_components=n_comp_a,
-                                   random_state=0)
-        maternal_ic_idx, _ = select_maternal_ic(ICs1_primary, fs)
-        maternal_ic        = get_ic_as_signal(ICs1_primary, maternal_ic_idx)
+        # Step 2: ICA1 — [MOD-2] PCA-adaptive n_components
+        self._log("Step 2: ICA1 (PCA-adaptive n_components)...")
+        n_comp_ica1    = determine_n_components(abd_proc, label="ICA1/abd_proc")
+        ICs1, _        = run_ica(abd_proc, n_components=n_comp_ica1)
+        maternal_ic_idx, _ = select_maternal_ic(ICs1, fs, cfg=cfg)
+        maternal_ic    = get_ic_as_signal(ICs1, maternal_ic_idx)
 
         # Step 3: Maternal QRS
         self._log("Step 3: Maternal QRS detection...")
-        maternal_peaks = detect_maternal_qrs(maternal_ic, fs)
+        maternal_peaks = detect_maternal_qrs(maternal_ic, fs, cfg=cfg)
         mat_hr_stats   = compute_hr_stats(maternal_peaks, fs)
         maternal_hr    = mat_hr_stats["mean_hr"]
         self._log(f"  {len(maternal_peaks)} maternal peaks, HR = {maternal_hr:.1f} BPM")
@@ -297,119 +672,89 @@ class PHASEPipeline:
                 ann_stats    = compute_hr_stats(ann_peaks, fs)
                 expected_fhr = ann_stats["mean_hr"]
                 self._log(f"  Annotation prior: {len(ann_peaks)} peaks, "
-                        f"expected fetal HR = {expected_fhr:.1f} BPM")
+                          f"expected fetal HR = {expected_fhr:.1f} BPM")
         elif ann_path and not ann_is_fetal:
             self._log("  Annotation skipped (not fetal ground truth)")
 
-        # Step 4: Path A — ensemble ICA1 + three-factor scoring [NEW-1, NEW-3]
-        self._log("Step 4: Path A -- ICA1 ensemble (three-factor scoring)...")
-        # Exclude the maternal IC from Path A ensemble scoring
-        mat_ic_exclude_fn = _make_maternal_residual_exclude_fn(
-            maternal_ic, cfg.MATERNAL_ICA2_CORR_THRESH)
-        try:
-            a_sig, a_run, a_comp, a_score = select_best_ic_from_ensemble(
-                ica1_sets, maternal_peaks, maternal_hr, fs,
-                exclude_fn=mat_ic_exclude_fn,
-                label="Path A")
-            a_peaks, a_hr = _candidate_hr(a_sig, fs, cfg)
-            a_n     = len(a_peaks)
-            a_valid = _is_fetal_hr(a_hr, maternal_hr, cfg)
-            a_idx   = a_comp   # for labelling
-        except ValueError as e:
-            self._log(f"  Path A ensemble failed: {e} -- falling back to single-run")
-            a_sig, a_idx, a_peaks, a_hr = _best_ic(
-                ICs1_primary, maternal_ic_idx, maternal_hr, fs, cfg,
-                label="Path A (fallback)", expected_hr=expected_fhr, min_peaks=min_peaks)
-            a_n     = len(a_peaks)
-            a_valid = _is_fetal_hr(a_hr, maternal_hr, cfg)
-            a_score = 0.0
-            a_run   = 0
-        self._log(f"  Path A: run={a_run+1}, comp={a_comp+1}, {a_n} peaks, "
+        # Step 4: Path A — [MOD-3] ensemble + [MOD-1] unified score
+        # Maternal IC selection is NOT ensembled (already reliable on both
+        # datasets; adding ensemble there gives no benefit and adds cost).
+        self._log("Step 4: Path A -- ICA1 ensemble (HR-aware, three-factor score)...")
+        a_sig, a_idx, a_peaks, a_hr, a_stability = _best_ic_ensemble(
+            abd_proc, maternal_ic_idx, maternal_hr, fs, cfg,
+            label="Path A", expected_hr=expected_fhr, min_peaks=min_peaks,
+            maternal_ic=maternal_ic, maternal_peaks=maternal_peaks,
+            path_b=False, n_components=n_comp_ica1)
+        a_n     = len(a_peaks)
+        a_valid = _is_fetal_hr(a_hr, maternal_hr, cfg)
+        self._log(f"  Path A: IC{a_idx+1}, {a_n} peaks, "
                   f"HR={a_hr:.1f} BPM, valid={'YES' if a_valid else 'NO'}, "
-                  f"3-factor-score={a_score:.4f}")
+                  f"stability={a_stability:.3f}")
 
         # Step 5: Gaussian weights
         self._log("Step 5: Gaussian weight matrix...")
         weights = gaussian_weight_matrix(abd_proc.shape[1], maternal_peaks, fs)
 
-        # Step 6: AW-WSVD with dataset-adaptive window [NEW-4]
-        self._log("Step 6: AW-WSVD maternal reconstruction...")
+        # Step 6: AW-WSVD — [MOD-4] adaptive window from recording duration
+        self._log("Step 6: AW-WSVD maternal reconstruction (adaptive window)...")
         svd_explained_variance(abd_proc)
         channel_r2 = np.array([
             float(np.corrcoef(abd_proc[ch], maternal_ic)[0, 1] ** 2)
             for ch in range(abd_proc.shape[0])
         ])
-        # [NEW-4] Use shorter window for CinC2013
-        wsvd_window = (WSVD_WINDOW_SEC_CINC
-                       if dataset.lower() == "cinc2013"
-                       else None)
-        if wsvd_window is not None:
-            self._log(f"  Using CinC2013 short WSVD window: {wsvd_window}s")
         maternal_recon = adaptive_windowed_wsvd(
-            abd_proc, weights, fs, mat_ic=maternal_ic, channel_r2=channel_r2,
-            window_sec=wsvd_window)
+            abd_proc, weights, fs,
+            mat_ic=maternal_ic, channel_r2=channel_r2,
+            duration_sec=duration,
+            cfg=cfg)    # [MOD-4]
 
         # Step 7: Maternal cancellation
         self._log("Step 7: Maternal cancellation...")
         residual = subtract_maternal(abd_proc, maternal_recon)
 
-        # Step 8: Path B — ICA2 ensemble on residual + three-factor scoring [NEW-1, NEW-3]
-        self._log("Step 8: Path B -- ICA2 ensemble on residual (three-factor scoring)...")
-        n_comp_b = pca_n_components(residual)
-        self._log(f"  PCA → {n_comp_b} components for Path B ICA2")
-        ica2_sets = run_ica_ensemble(residual, n_components=n_comp_b)
+        # Step 8: Path B — [MOD-2] adaptive n_components, [MOD-3] ensemble,
+        #                   [MOD-1] unified score with half-weight maternal penalty
+        self._log("Step 8: Path B -- ICA2 ensemble on residual (adaptive n_comp, half-penalty)...")
+        n_comp_ica2      = determine_n_components(residual, label="ICA2/residual")
+        ICs2_ref, _      = run_ica(residual, n_components=n_comp_ica2)
+        mat_residual_idx = _find_maternal_residual_idx(ICs2_ref, maternal_ic, cfg)
 
-        # [FIX-1] Maternal residual exclusion via ensemble exclude_fn
-        mat_residual_exclude_fn = _make_maternal_residual_exclude_fn(
-            maternal_ic, cfg.MATERNAL_ICA2_CORR_THRESH)
-        try:
-            b_sig, b_run, b_comp, b_score = select_best_ic_from_ensemble(
-                ica2_sets, maternal_peaks, maternal_hr, fs,
-                exclude_fn=mat_residual_exclude_fn,
-                label="Path B")
-            b_peaks, b_hr = _candidate_hr(b_sig, fs, cfg)
-            b_n     = len(b_peaks)
-            b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
-        except ValueError as e:
-            self._log(f"  Path B ensemble failed: {e} -- falling back to single-run")
-            ICs2_fallback, _ = run_ica(residual, n_components=n_comp_b)
-            mat_residual_idx = _find_maternal_residual_idx(ICs2_fallback, maternal_ic, cfg)
-            b_sig, b_idx, b_peaks, b_hr = _best_ic(
-                ICs2_fallback, mat_residual_idx, maternal_hr, fs, cfg,
-                label="Path B (fallback)", expected_hr=expected_fhr, min_peaks=min_peaks)
-            b_n     = len(b_peaks)
-            b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
-            b_score = 0.0
-            b_run   = 0
-            b_comp  = 0
-        self._log(f"  Path B: run={b_run+1}, comp={b_comp+1}, {b_n} peaks, "
+        b_sig, b_idx, b_peaks, b_hr, b_stability = _best_ic_ensemble(
+            residual, mat_residual_idx, maternal_hr, fs, cfg,
+            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks,
+            maternal_ic=maternal_ic, maternal_peaks=maternal_peaks,
+            path_b=True,             # [MOD-1] half-weight maternal penalty
+            n_components=n_comp_ica2)
+        b_n     = len(b_peaks)
+        b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
+        self._log(f"  Path B: IC{b_idx+1}, {b_n} peaks, "
                   f"HR={b_hr:.1f} BPM, valid={'YES' if b_valid else 'NO'}, "
-                  f"3-factor-score={b_score:.4f}")
+                  f"stability={b_stability:.3f}")
 
         # Step 9: Select best path
         self._log("Step 9: Selecting best path...")
         if a_valid and b_valid:
-            # Prefer by three-factor score; fall back to PATH_A_PREFERENCE on tie
-            if a_score >= b_score * cfg.PATH_A_PREFERENCE:
+            if a_n >= b_n * cfg.PATH_A_PREFERENCE:
                 chosen_sig, chosen_peaks = a_sig, a_peaks
-                chosen_path = f"A_ICA1_direct_run{a_run+1}_comp{a_comp+1}_{a_hr:.0f}bpm"
+                chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
             else:
                 chosen_sig, chosen_peaks = b_sig, b_peaks
-                chosen_path = f"B_WSVD_ICA2_run{b_run+1}_comp{b_comp+1}_{b_hr:.0f}bpm"
+                chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
         elif a_valid:
             chosen_sig, chosen_peaks = a_sig, a_peaks
-            chosen_path = f"A_ICA1_direct_run{a_run+1}_comp{a_comp+1}_{a_hr:.0f}bpm"
+            chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
         elif b_valid:
             chosen_sig, chosen_peaks = b_sig, b_peaks
-            chosen_path = f"B_WSVD_ICA2_run{b_run+1}_comp{b_comp+1}_{b_hr:.0f}bpm"
+            chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
         else:
-            # Neither path valid — pick by three-factor score
+            a_score = _hr_score(a_hr, cfg)
+            b_score = _hr_score(b_hr, cfg)
             if a_score >= b_score:
                 chosen_sig, chosen_peaks = a_sig, a_peaks
-                chosen_path = f"A_fallback_run{a_run+1}_comp{a_comp+1}_{a_hr:.0f}bpm"
+                chosen_path = f"A_fallback_IC{a_idx+1}_{a_hr:.0f}bpm"
             else:
                 chosen_sig, chosen_peaks = b_sig, b_peaks
-                chosen_path = f"B_fallback_run{b_run+1}_comp{b_comp+1}_{b_hr:.0f}bpm"
+                chosen_path = f"B_fallback_IC{b_idx+1}_{b_hr:.0f}bpm"
         self._log(f"  Selected: {chosen_path} ({len(chosen_peaks)} peaks)")
 
         # Step 10: EKF-RTS
@@ -441,12 +786,15 @@ class PHASEPipeline:
             ref_peaks = np.array([])
             self._log("  Reference: none available")
         metrics = evaluate(
-                fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
-                label=f"PHASE ({rec_id})",
-                tolerance_ms=cfg.EVAL_TOLERANCE_MS
-            )
+            fetal_ecg, dir_proc, fetal_peaks, ref_peaks, fs,
+            label=f"PHASE ({rec_id})",
+            tolerance_ms=cfg.EVAL_TOLERANCE_MS
+        )
 
         # Step 13: ECHO XAI -- [FIX-3] explicit has_reference flag
+        # The ensemble stability scores (a_stability, b_stability) from [MOD-3]
+        # are available here and can be passed to ECHO as a fourth attribution
+        # dimension (stability of IC selection across ensemble runs).
         self._log("Step 13: ECHO XAI...")
         has_ref  = dir_proc is not None
         echo_ref = dir_proc if has_ref else None
@@ -455,6 +803,10 @@ class PHASEPipeline:
             fetal_peaks=fetal_peaks, fetal_signal=fetal_ecg,
             reference_signal=echo_ref, has_reference=has_ref)
         attribution = echo.compute_attributions()
+        # Attach stability score to attribution dict for downstream use / reporting
+        chosen_stability = a_stability if "A_" in chosen_path else b_stability
+        if isinstance(attribution, dict):
+            attribution["ic_stability"] = float(chosen_stability)
         print(echo.generate_summary_stats(attribution))
         if attribution and attribution["n_beats"] > 0:
             print(echo.generate_clinical_report(0, attribution))
@@ -465,7 +817,7 @@ class PHASEPipeline:
                 fetal_ecg, fetal_ic_raw, dir_proc,
                 fetal_peaks, ref_peaks, echo, figures_dir, rec_id)
 
-        result = {
+        return {
             "recording"     : rec_id,
             "fetal_ecg"     : fetal_ecg,
             "fetal_ecg_pre" : fetal_ic_raw,
@@ -481,8 +833,8 @@ class PHASEPipeline:
             "echo"          : echo,
             "attribution"   : attribution,
             "chosen_path"   : chosen_path,
+            "ic_stability"  : chosen_stability,   # [MOD-3] for dissertation reporting
         }
-        return result
 
     def run_with_ablation(self, recording):
         self._log("Running ablation study...")
@@ -490,34 +842,35 @@ class PHASEPipeline:
         abd      = recording["abdomen"]
         direct   = recording["direct"]
         duration = recording.get("duration_sec", abd.shape[1] / fs)
-        min_peaks = _min_usable_peaks(duration, self.cfg,
-                                       recording.get("dataset", "ADFECGDB"))
+        cfg      = self.cfg
+        min_peaks = _min_usable_peaks(duration, cfg)
 
-        abd_proc  = preprocess_multichannel(abd, fs)
-        dir_proc  = preprocess_channel(direct, fs)
+        abd_proc  = preprocess_multichannel(abd, fs, cfg=cfg)
+        dir_proc  = preprocess_channel(direct, fs, cfg=cfg)
         ref_peaks = detect_reference_fetal_qrs(dir_proc, fs)
         results   = {}
 
         ICs1, _          = run_ica(abd_proc)
-        mat_idx_blind, _ = select_maternal_ic(ICs1, fs)
+        mat_idx_blind, _ = select_maternal_ic(ICs1, fs, cfg=cfg)
         mat_ic_blind     = get_ic_as_signal(ICs1, mat_idx_blind)
-        mat_peaks_blind  = detect_maternal_qrs(mat_ic_blind, fs)
+        mat_peaks_blind  = detect_maternal_qrs(mat_ic_blind, fs, cfg=cfg)
         mat_hr_blind     = compute_hr_stats(mat_peaks_blind, fs)["mean_hr"]
         weights_gauss    = gaussian_weight_matrix(abd_proc.shape[1], mat_peaks_blind, fs)
 
         def _eval(sig, peaks, label):
             return evaluate(sig, dir_proc, peaks, ref_peaks, fs, label=label)
 
-        def _select(ICs, excl, mat_hr):
-            sig, idx, peaks, hr = _best_ic(ICs, excl, mat_hr, fs, self.cfg,
-                                            min_peaks=min_peaks)
+        def _select(ICs, excl, mat_hr, mat_ic=None, mat_peaks=None, p_b=False):
+            sig, idx, peaks, hr = _best_ic(
+                ICs, excl, mat_hr, fs, cfg, min_peaks=min_peaks,
+                maternal_ic=mat_ic, maternal_peaks=mat_peaks, path_b=p_b)
             return sig, peaks
 
         # Config 1: Baseline
         self._log("  Config 1: Baseline -- naive ICA + global binary WSVD...")
         mat_idx_naive   = int(np.argmax([np.var(ic) for ic in ICs1]))
         mat_ic_naive    = get_ic_as_signal(ICs1, mat_idx_naive)
-        mat_peaks_naive = detect_maternal_qrs(mat_ic_naive, fs)
+        mat_peaks_naive = detect_maternal_qrs(mat_ic_naive, fs, cfg=self.cfg)
         weights_binary  = _binary_weight_matrix(abd_proc.shape[1], mat_peaks_naive, fs)
         mat_recon_1 = _global_wsvd(abd_proc, weights_binary)
         residual_1  = subtract_maternal(abd_proc, mat_recon_1)
@@ -532,8 +885,8 @@ class PHASEPipeline:
         mat_recon_2 = _global_wsvd(abd_proc, _binary_weight_matrix(abd_proc.shape[1], mat_peaks_blind, fs))
         residual_2  = subtract_maternal(abd_proc, mat_recon_2)
         ICs2_2, _   = run_ica(residual_2)
-        excl_2      = _find_maternal_residual_idx(ICs2_2, mat_ic_blind, self.cfg)
-        sig_2, pks_2 = _select(ICs2_2, excl_2, mat_hr_blind)
+        excl_2      = _find_maternal_residual_idx(ICs2_2, mat_ic_blind, cfg)
+        sig_2, pks_2 = _select(ICs2_2, excl_2, mat_hr_blind, mat_ic_blind, mat_peaks_blind)
         results["2_Blind_IC_Selection"] = _eval(sig_2, pks_2, "+Blind IC Selection")
 
         # Config 3: + Gaussian weights
@@ -541,20 +894,22 @@ class PHASEPipeline:
         mat_recon_3 = _global_wsvd(abd_proc, weights_gauss)
         residual_3  = subtract_maternal(abd_proc, mat_recon_3)
         ICs2_3, _   = run_ica(residual_3)
-        excl_3      = _find_maternal_residual_idx(ICs2_3, mat_ic_blind, self.cfg)
-        sig_3, pks_3 = _select(ICs2_3, excl_3, mat_hr_blind)
+        excl_3      = _find_maternal_residual_idx(ICs2_3, mat_ic_blind, cfg)
+        sig_3, pks_3 = _select(ICs2_3, excl_3, mat_hr_blind, mat_ic_blind, mat_peaks_blind)
         results["3_Gaussian_Weights"] = _eval(sig_3, pks_3, "+Gaussian Weights")
 
-        # Config 4: + Adaptive windowed WSVD
+        # Config 4: + Adaptive windowed WSVD  ([MOD-4] duration passed through)
         self._log("  Config 4: + Adaptive Windowed WSVD...")
         channel_r2  = np.array([float(np.corrcoef(abd_proc[ch], mat_ic_blind)[0, 1] ** 2)
                                  for ch in range(abd_proc.shape[0])])
         mat_recon_4 = adaptive_windowed_wsvd(abd_proc, weights_gauss, fs,
-                                              mat_ic=mat_ic_blind, channel_r2=channel_r2)
+                                              mat_ic=mat_ic_blind, channel_r2=channel_r2,
+                                              duration_sec=duration,
+                                              cfg=cfg)   # [MOD-4]
         residual_4  = subtract_maternal(abd_proc, mat_recon_4)
         ICs2_4, _   = run_ica(residual_4)
-        excl_4      = _find_maternal_residual_idx(ICs2_4, mat_ic_blind, self.cfg)
-        sig_4, pks_4 = _select(ICs2_4, excl_4, mat_hr_blind)
+        excl_4      = _find_maternal_residual_idx(ICs2_4, mat_ic_blind, cfg)
+        sig_4, pks_4 = _select(ICs2_4, excl_4, mat_hr_blind, mat_ic_blind, mat_peaks_blind, p_b=True)
         results["4_Adaptive_WSVD"] = _eval(sig_4, pks_4, "+Adaptive WSVD")
 
         # Config 5: + EKF-RTS
@@ -585,7 +940,6 @@ class PHASEPipeline:
             abd_proc, maternal_recon, residual, self.fs,
             save_path=str(fdir / f"{rec_id}_maternal_cancellation.png"))
 
-        # Pass None for reference if no direct electrode available
         has_direct = dir_proc is not None and hasattr(dir_proc, '__len__') and len(dir_proc) > 0
         plot_fetal_comparison(
             fetal_ecg,
@@ -606,7 +960,7 @@ class PHASEPipeline:
         self._log(f"Figures saved to {figures_dir}/")
 
 
-# -- Ablation helpers --------------------------------------------------------
+# ── Ablation helpers ─────────────────────────────────────────────────────────
 
 def _binary_weight_matrix(n_samples, qrs_peaks, fs, window_sec=0.1):
     weights = np.ones(n_samples) * 0.1

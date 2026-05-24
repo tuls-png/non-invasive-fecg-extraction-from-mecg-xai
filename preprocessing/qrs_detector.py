@@ -198,13 +198,17 @@ def detect_maternal_qrs(maternal_ic: np.ndarray, fs: int = FS, cfg: BaseConfig =
     if cfg is None:
         bp_low = PT_MATERNAL_BANDPASS_LOW
         bp_high = PT_MATERNAL_BANDPASS_HIGH
+        min_hr_bpm = 50
+        max_hr_bpm = 115
     else:
         bp_low = cfg.PT_MATERNAL_BANDPASS_LOW
         bp_high = cfg.PT_MATERNAL_BANDPASS_HIGH
+        min_hr_bpm = cfg.MATERNAL_HR_MIN
+        max_hr_bpm = cfg.MATERNAL_HR_MAX
     
     peaks, _ = pan_tompkins(
         maternal_ic, fs,
-        min_hr_bpm=50, max_hr_bpm=115,
+        min_hr_bpm=min_hr_bpm, max_hr_bpm=max_hr_bpm,
         bp_low=bp_low,
         bp_high=bp_high,
         cfg=cfg,

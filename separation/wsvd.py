@@ -6,15 +6,24 @@ FIX: Removed two duplicate function bodies that appeared after the first
 return statement in adaptive_windowed_wsvd. Only the most complete version
 (with per-channel subtraction gating and energy protection) is kept.
 
-NEW FEATURES:
-  [NEW-4] Dataset-adaptive WSVD window length: adaptive_windowed_wsvd() now
-          accepts an optional `window_sec` override parameter so the pipeline
-          can pass a shorter window for CinC2013 (2-3 s instead of 5 s).
-          Shorter windows give more stable per-window SVD estimates on the
-          short, noisy CinC2013 recordings without touching the global default.
-          The module-level WSVD_WINDOW_SEC_CINC constant defines the default
-          CinC2013 override. The pipeline selects which value to pass based on
-          recording dataset.
+DISSERTATION MODIFICATION:
+  [MOD-4] Adaptive WSVD window for short recordings.
+          adaptive_windowed_wsvd() now accepts an optional duration_sec
+          parameter. When provided, the window length is derived from:
+
+              min_windows   = 15    # need at least this many windows for stable SVD
+              adaptive_win  = min(WSVD_WINDOW_SEC, duration_sec / min_windows)
+              adaptive_win  = max(adaptive_win, 1.5)   # floor at 1.5 seconds
+
+          On CinC2013's 60-second recordings this gives ~3-second windows
+          (~20 windows) instead of 5-second windows (~12 windows). More
+          windows produce a more robust overlap-add reconstruction and better
+          maternal cancellation. On ADFECGDB's 5-minute recordings the formula
+          gives the same window as the config default (300/15 = 20 s, capped to
+          WSVD_WINDOW_SEC). The behaviour is identical — same code, adaptive.
+
+          This is an engineering fix with no novelty claim; it is documented
+          transparently in the dissertation as a robustness measure.
 """
 
 import numpy as np
@@ -32,8 +41,9 @@ WSVD_COMPONENT_CORR_THRESH = _cfg.WSVD_COMPONENT_CORR_THRESH
 WSVD_MAX_ENERGY_REMOVAL = _cfg.WSVD_MAX_ENERGY_REMOVAL
 WSVD_CHANNEL_R2_MIN = _cfg.WSVD_CHANNEL_R2_MIN
 
-# [NEW-4] Shorter window for CinC2013 — improves SVD stability on short recordings
-WSVD_WINDOW_SEC_CINC = 2.5   # seconds; original default is 5 s
+# [MOD-4] adaptive window parameters
+_ADAPTIVE_MIN_WINDOWS = 15    # minimum number of windows for stable SVD
+_ADAPTIVE_WIN_FLOOR_SEC = 1.5  # hard floor on window length
 
 
 def gaussian_weight_matrix(n_samples: int, qrs_peaks: np.ndarray,
@@ -76,10 +86,11 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
                             weights: np.ndarray,
                             fs: int = FS,
                             mat_ic: np.ndarray = None,
-                            n_components: int = WSVD_N_COMPONENTS,
-                            corr_thresh: float = WSVD_COMPONENT_CORR_THRESH,
+                            n_components: int = None,
+                            corr_thresh: float = None,
                             channel_r2: np.ndarray = None,
-                            window_sec: float = None) -> np.ndarray:
+                            duration_sec: float = None,
+                            cfg: BaseConfig = None) -> np.ndarray:
     """
     Adaptive Windowed WSVD with per-window maternal correlation validation
     and per-channel subtraction gating.
@@ -93,31 +104,59 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
     Windows where nothing passes are left unchanged — safer than
     over-subtraction.
 
+    [MOD-4] Adaptive window length:
+    When duration_sec is provided, the window length is computed as:
+
+        adaptive_win_sec = min(WSVD_WINDOW_SEC, duration_sec / min_windows)
+        adaptive_win_sec = max(adaptive_win_sec, 1.5)   # floor at 1.5 s
+
+    This ensures ≥ 15 windows on short recordings (e.g. CinC2013's 60-second
+    recordings) for stable SVD, while preserving the configured window length
+    on long recordings (ADFECGDB). No dataset-specific branching — the formula
+    is self-adapting.
+
     Parameters
     ----------
-    abd         : (n_ch, N) preprocessed abdominal signal
-    weights     : (N,) Gaussian weight matrix
-    fs          : sampling rate
-    mat_ic      : (N,) maternal IC for per-window correlation validation
-    n_components: max SVD components to consider per window
-    corr_thresh : minimum |correlation| to accept component as maternal
-    channel_r2  : (n_ch,) maternal IC R^2 per channel
-    window_sec  : [NEW-4] override window length in seconds. If None, uses
-                  the module-level WSVD_WINDOW_SEC default. Pass
-                  WSVD_WINDOW_SEC_CINC (2.5 s) for CinC2013 recordings to
-                  improve SVD stability on short noisy signals.
+    abd          : (n_ch, N) preprocessed abdominal signal
+    weights      : (N,) Gaussian weight matrix
+    fs           : sampling rate
+    mat_ic       : (N,) maternal IC for per-window correlation validation
+    n_components : max SVD components to consider per window
+    corr_thresh  : minimum |correlation| to accept component as maternal
+    channel_r2   : (n_ch,) maternal IC R^2 per channel
+    duration_sec : [MOD-4] recording duration in seconds; if None, falls back
+                   to the fixed WSVD_WINDOW_SEC from config
+    cfg          : BaseConfig, optional dataset-specific override
 
     Returns
     -------
     recon : (n_ch, N) reconstructed maternal signal
     """
-    # [NEW-4] Use caller-supplied window or fall back to module default
-    effective_window_sec = window_sec if window_sec is not None else WSVD_WINDOW_SEC
+    if cfg is None:
+        cfg = _cfg
+    if n_components is None:
+        n_components = cfg.WSVD_N_COMPONENTS
+    if corr_thresh is None:
+        corr_thresh = cfg.WSVD_COMPONENT_CORR_THRESH
 
     n_ch, N = abd.shape
-    win_len = int(effective_window_sec * fs)
-    hop     = int(win_len * (1.0 - WSVD_OVERLAP))
+
+    # [MOD-4] Compute adaptive window length
+    if duration_sec is not None:
+        max_win_sec      = cfg.WSVD_WINDOW_SEC
+        adaptive_win_sec = min(max_win_sec, duration_sec / _ADAPTIVE_MIN_WINDOWS)
+        adaptive_win_sec = max(adaptive_win_sec, _ADAPTIVE_WIN_FLOOR_SEC)
+    else:
+        adaptive_win_sec = cfg.WSVD_WINDOW_SEC
+
+    win_len = int(adaptive_win_sec * fs)
+    hop     = int(win_len * (1.0 - cfg.WSVD_OVERLAP))
     H       = np.hanning(win_len)
+
+    print(f"[AW-WSVD] Window = {adaptive_win_sec:.2f}s "
+          f"({'adaptive' if duration_sec is not None else 'fixed'}), "
+          f"hop = {hop/fs:.2f}s, "
+          f"expected windows ≈ {max(0, N - win_len) // hop + 1}")
 
     recon      = np.zeros_like(abd)
     weight_pad = np.zeros(N)
@@ -127,10 +166,10 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
 
     # Determine which channels to subtract from
     if channel_r2 is not None:
-        subtract_mask = np.array(channel_r2) >= WSVD_CHANNEL_R2_MIN
+        subtract_mask = np.array(channel_r2) >= cfg.WSVD_CHANNEL_R2_MIN
         if not subtract_mask.any():
             subtract_mask[:] = True   # fallback: use all channels
-        print(f"[AW-WSVD] Channel subtraction mask (R^2>={WSVD_CHANNEL_R2_MIN}): "
+        print(f"[AW-WSVD] Channel subtraction mask (R^2>={cfg.WSVD_CHANNEL_R2_MIN}): "
               f"{[f'ch{i+1}:{subtract_mask[i]}(R^2={channel_r2[i]:.3f})' for i in range(n_ch)]}")
     else:
         subtract_mask = np.ones(n_ch, dtype=bool)
@@ -175,7 +214,7 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
             # Energy protection: skip if reconstruction removes too much energy
             orig_energy  = np.sum(abd[:, start:stop] ** 2) + 1e-12
             recon_energy = np.sum(Xrec ** 2)
-            if recon_energy / orig_energy > WSVD_MAX_ENERGY_REMOVAL:
+            if recon_energy / orig_energy > cfg.WSVD_MAX_ENERGY_REMOVAL:
                 Xrec = np.zeros((n_ch, win_len))
                 skipped_count += 1
             else:
@@ -193,7 +232,7 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
     recon[:, nonzero] /= weight_pad[None, nonzero]
 
     print(f"[AW-WSVD] Processed {win_count} windows "
-          f"(window={effective_window_sec}s, overlap={WSVD_OVERLAP*100:.0f}%, "
+          f"(window={adaptive_win_sec:.2f}s, overlap={cfg.WSVD_OVERLAP*100:.0f}%, "
           f"components={n_components}, corr_thresh={corr_thresh})")
     if skipped_count > 0:
         pct = 100 * skipped_count / (win_count + 1e-8)
