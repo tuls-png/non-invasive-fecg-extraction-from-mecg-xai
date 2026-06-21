@@ -19,6 +19,21 @@ FIX: compute_fhr_mae() previously returned a rough, unreliable estimate
 when the overlap between detected and reference HR series was too small.
 It now returns np.nan in that case so aggregate_results() can filter it
 cleanly rather than silently polluting results tables.
+
+CHANGES:
+  [PATH-FIX-2] aggregate_results() now accepts an optional exclude_flags
+               dict that maps recording IDs to boolean exclusion flags
+               (low_confidence, annotation_suspect). Flagged recordings are
+               reported separately and excluded from the primary aggregate
+               statistics. This makes it possible to report honest aggregate
+               numbers that exclude the algorithmically uncertain cases
+               (score < LOW_CONF_THRESHOLD) and annotation anomalies (a54)
+               without silently discarding them.
+
+  [PATH-FIX-4] aggregate_results() prints a separate summary for flagged
+               recordings so they are visible in the output, not silently
+               dropped. The dissertation should report BOTH the full-set
+               and the clean-set numbers and explain the exclusion criteria.
 """
 
 import numpy as np
@@ -284,29 +299,77 @@ def wilcoxon_test(scores_a: list, scores_b: list,
     }
 
 
-def aggregate_results(results_list: list[dict]) -> dict:
+def aggregate_results(results_list: list[dict],
+                       exclude_flags: dict | None = None) -> dict:
     """
     Aggregate per-recording metrics to mean +/- std for the paper's results table.
 
     NaN values (e.g. from compute_fhr_mae fallback) are excluded cleanly.
+
+    [PATH-FIX-2 / PATH-FIX-4] Optional exclude_flags support.
+
+    Parameters
+    ----------
+    results_list : list of per-recording metric dicts (from evaluate())
+    exclude_flags : optional dict mapping recording label → bool.
+                    When provided, recordings whose flag is True are moved
+                    to a separate "flagged" aggregate and excluded from the
+                    primary aggregate. This enables clean reporting of:
+                      - low_confidence cases (score < LOW_CONF_THRESHOLD)
+                      - annotation_suspect cases (e.g. a54 with 37 ref beats)
+                    Both sets are printed; only the clean set is returned.
+
+                    Example:
+                        flags = {
+                            "PHASE (a54)": True,   # annotation anomaly
+                            "PHASE (a07)": True,   # low confidence
+                        }
+                        aggregate_results(all_metrics, exclude_flags=flags)
+
+    Returns
+    -------
+    dict : aggregated metrics for the CLEAN set (excluding flagged recordings).
+           If no exclude_flags provided, this is the full set (original behaviour).
     """
     metrics = ["SNR_dB", "PRD_pct", "RMSE", "CC",
                "Se", "PPV", "F1", "FHR_MAE_bpm"]
-    agg = {}
-    for m in metrics:
-        vals = [r[m] for r in results_list
-                if not np.isnan(float(r.get(m, np.nan)))]
-        if vals:
-            agg[f"{m}_mean"] = float(np.mean(vals))
-            agg[f"{m}_std"]  = float(np.std(vals))
-            agg[f"{m}_ci95"] = 1.96 * float(np.std(vals)) / np.sqrt(len(vals))
 
-    print(f"\n{'='*55}")
-    print("  Aggregated Results (mean +/- std across recordings)")
-    print(f"{'='*55}")
-    for m in metrics:
-        if f"{m}_mean" in agg:
-            print(f"  {m:15s}: {agg[f'{m}_mean']:.3f} +/- {agg[f'{m}_std']:.3f}")
-    print(f"{'='*55}\n")
+    # Partition into clean and flagged
+    if exclude_flags is not None:
+        clean_list   = [r for r in results_list
+                        if not exclude_flags.get(r.get("label", ""), False)]
+        flagged_list = [r for r in results_list
+                        if exclude_flags.get(r.get("label", ""), False)]
+    else:
+        clean_list   = results_list
+        flagged_list = []
 
-    return agg
+    def _agg_one(rlist, label):
+        agg = {}
+        for m in metrics:
+            vals = [r[m] for r in rlist
+                    if not np.isnan(float(r.get(m, np.nan)))]
+            if vals:
+                agg[f"{m}_mean"] = float(np.mean(vals))
+                agg[f"{m}_std"]  = float(np.std(vals))
+                agg[f"{m}_ci95"] = 1.96 * float(np.std(vals)) / np.sqrt(len(vals))
+
+        print(f"\n{'='*55}")
+        print(f"  {label} (n={len(rlist)})")
+        print(f"{'='*55}")
+        for m in metrics:
+            if f"{m}_mean" in agg:
+                print(f"  {m:15s}: {agg[f'{m}_mean']:.3f} +/- {agg[f'{m}_std']:.3f}")
+        print(f"{'='*55}\n")
+        return agg
+
+    clean_agg = _agg_one(clean_list, "Aggregated Results — clean set")
+
+    if flagged_list:
+        print(f"[AGGREGATE] {len(flagged_list)} recordings excluded from clean set "
+              f"(low_confidence or annotation_suspect):")
+        for r in flagged_list:
+            print(f"  {r.get('label','?')}: F1={r.get('F1', float('nan')):.1f}%")
+        _agg_one(flagged_list, "Aggregated Results — flagged set (for reference only)")
+
+    return clean_agg

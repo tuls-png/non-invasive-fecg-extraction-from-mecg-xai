@@ -26,6 +26,9 @@ from evaluation.metrics import aggregate_results, wilcoxon_test
 from utils.logger import ResultsLogger
 from utils.visualization import plot_ablation_results, plot_sota_comparison
 
+# At the top
+from phase_logger import PhaseLogger
+log_log = PhaseLogger(log_dir="logs")
 
 def run_full_dataset(dataset_name: str, data_dir: str, save_figures: bool = True, max_recordings: int = None):
     """
@@ -74,6 +77,7 @@ def run_full_dataset(dataset_name: str, data_dir: str, save_figures: bool = True
                 save_figures=save_figures,
                 figures_dir=f"figures_{dataset_name}"
             )
+            log_log.log_recording(result["recording"], result.get("debug_log", {}))
             logger.log_recording(rec["recording"], f"PHASE_{dataset_name}", result["metrics"])
             all_metrics.append(result["metrics"])
         except Exception as e:
@@ -81,6 +85,8 @@ def run_full_dataset(dataset_name: str, data_dir: str, save_figures: bool = True
             import traceback
             traceback.print_exc()
             continue
+
+    log_log.close()
 
     # Print summary
     print("\n" + "="*70)

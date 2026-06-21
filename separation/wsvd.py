@@ -53,8 +53,10 @@ def gaussian_weight_matrix(n_samples: int, qrs_peaks: np.ndarray,
     """
     Construct a Gaussian physiological weight vector.
 
-    Each QRS peak contributes a Gaussian bump of width sigma.
-    The baseline weight ensures non-QRS regions are not completely ignored.
+    Each maternal R peak contributes a narrow QRS Gaussian plus a broader,
+    lower-amplitude PQRST support window. The broader support helps WSVD model
+    maternal P/T residuals that otherwise survive QRS-only cancellation and
+    can be misdetected as fetal beats.
 
     Parameters
     ----------
@@ -71,8 +73,17 @@ def gaussian_weight_matrix(n_samples: int, qrs_peaks: np.ndarray,
     weights = np.full(n_samples, baseline, dtype=np.float64)
     sigma_s = sigma_sec * fs
     radius  = int(4 * sigma_s)
+    pqrst_sigma_s = max(sigma_s, 0.16 * fs)
+    pqrst_radius  = int(3 * pqrst_sigma_s)
+    pqrst_gain    = 0.35
 
     for peak in qrs_peaks:
+        lo_w = max(0, peak - pqrst_radius)
+        hi_w = min(n_samples, peak + pqrst_radius + 1)
+        t_w  = np.arange(lo_w, hi_w) - peak
+        broad = baseline + pqrst_gain * np.exp(-t_w**2 / (2 * pqrst_sigma_s**2))
+        weights[lo_w:hi_w] = np.maximum(weights[lo_w:hi_w], broad)
+
         lo = max(0, peak - radius)
         hi = min(n_samples, peak + radius + 1)
         t_local  = np.arange(lo, hi) - peak
@@ -194,14 +205,23 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
             mat_seg = mat_ic[start:stop]
             for k in range(r):
                 comp   = (U[:, k:k+1] * S[k]) @ Vt[k:k+1, :]
-                scalar = comp.mean(axis=0)
-                if len(mat_seg) == len(scalar):
+                corr_vals = []
+                for ch in range(n_ch):
                     try:
-                        c = np.corrcoef(scalar, mat_seg)[0, 1]
-                        if np.isfinite(c) and abs(c) >= corr_thresh:
-                            keep_mask[k] = True
+                        c = np.corrcoef(comp[ch], mat_seg)[0, 1]
                     except Exception:
-                        pass
+                        c = np.nan
+                    if np.isfinite(c):
+                        corr_vals.append(abs(float(c)))
+
+                # Opposite polarities across abdominal leads can cancel if the
+                # component is averaged first. Use the strongest channel-wise
+                # maternal projection, with a median fallback for robustness.
+                if corr_vals:
+                    max_corr = max(corr_vals)
+                    med_corr = float(np.median(corr_vals))
+                    if max_corr >= corr_thresh or med_corr >= 0.75 * corr_thresh:
+                        keep_mask[k] = True
         else:
             keep_mask[:] = True
 

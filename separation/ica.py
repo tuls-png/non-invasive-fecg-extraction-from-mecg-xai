@@ -146,14 +146,23 @@ def _detect_peaks_adaptive(ic: np.ndarray, fs: int,
                             cfg: BaseConfig = None
                             ) -> tuple[np.ndarray, float]:
     """
-    [FIX-3] Adaptive threshold Pan-Tompkins peak detector.
+    [FIX-3 + IMPROVEMENT] Adaptive threshold Pan-Tompkins peak detector.
 
-    Tries progressively lower thresholds (like detect_fetal_qrs) but ONLY
-    accepts a threshold if the resulting peaks have a mean HR inside
-    [hr_lo_gate, hr_hi_gate]. This prevents noise/T-wave pickup from passing
-    the HR gate by accident.
+    IMPROVEMENT: Previously used a single fixed integration window and
+    stopped at the first in-range HR candidate (highest threshold = fewest
+    peaks). This caused score_fetal_ic() and score_maternal_ic() to under-
+    count peaks on high-HR recordings (>160 BPM) and on post-subtraction
+    ICs where QRS amplitude variance is high, making valid fetal ICs score
+    the same as noisy ICs.
 
-    Returns (best_peaks, mean_hr).  best_peaks may be empty if nothing found.
+    Now mirrors the multi-window sweep from detect_fetal_qrs:
+    - Tries integration windows [80, 50, 35, 20] ms
+    - Uses completeness-weighted scoring: score = n_peaks × completeness
+      where completeness = min(n_peaks / expected_n, 1.0)
+    - Returns the globally best (window, threshold) combination
+    - Does NOT break on first match — evaluates all combinations
+
+    Returns (best_peaks, mean_hr). best_peaks may be empty if nothing found.
     """
     cfg = _get_cfg(cfg)
     nyq      = 0.5 * fs
@@ -161,32 +170,36 @@ def _detect_peaks_adaptive(ic: np.ndarray, fs: int,
     filtered = filtfilt(b, a, ic)
     diff     = np.gradient(filtered)
     squared  = diff ** 2
-    win      = max(1, int(cfg.PT_INTEGRATION_WINDOW_SEC * fs))
-    intg     = np.convolve(squared, np.ones(win) / win, mode='same')
-
-    sig_mean = np.mean(intg)
-    sig_std  = np.std(intg)
     min_dist = int((60.0 / max_hr_bpm) * fs)
+    duration_sec = len(ic) / fs
 
-    best_peaks  = np.array([])
+    best_peaks   = np.array([])
     best_mean_hr = np.nan
+    best_score   = -1.0
 
-    # Start at configured threshold and progressively relax
-    threshold_factors = [cfg.PT_THRESHOLD_FACTOR, 0.5, 0.2, 0.08, 0.03, 0.01]
-    for factor in threshold_factors:
-        thr    = sig_mean + factor * sig_std
-        pks, _ = find_peaks(intg, height=thr, distance=min_dist)
-        if len(pks) < 4:
-            continue
-        rr = np.diff(pks) / fs
-        if len(rr) == 0:
-            continue
-        mean_hr = float(60.0 / np.mean(rr))
-        if hr_lo_gate <= mean_hr <= hr_hi_gate:
-            # First in-range candidate wins (threshold is highest possible = cleanest)
-            best_peaks   = pks
-            best_mean_hr = mean_hr
-            break
+    for win_ms in [80, 50, 35, 20]:
+        win  = max(1, int(win_ms / 1000.0 * fs))
+        intg = np.convolve(squared, np.ones(win) / win, mode='same')
+        sig_mean = np.mean(intg)
+        sig_std  = np.std(intg)
+
+        for factor in [cfg.PT_THRESHOLD_FACTOR, 0.5, 0.2, 0.08, 0.03, 0.01]:
+            thr    = sig_mean + factor * sig_std
+            pks, _ = find_peaks(intg, height=thr, distance=min_dist)
+            if len(pks) < 4:
+                continue
+            rr = np.diff(pks) / fs
+            if len(rr) == 0:
+                continue
+            mean_hr = float(60.0 / np.mean(rr))
+            if hr_lo_gate <= mean_hr <= hr_hi_gate:
+                expected_n   = max(1.0, mean_hr / 60.0 * duration_sec)
+                completeness = min(len(pks) / expected_n, 1.0)
+                score        = len(pks) * completeness
+                if score > best_score:
+                    best_score   = score
+                    best_peaks   = pks
+                    best_mean_hr = mean_hr
 
     return best_peaks, best_mean_hr
 

@@ -16,7 +16,7 @@ import numpy as np
 class BaseConfig:
     """
     Unified configuration for PHASE pipeline.
-    
+
     Supports per-dataset overrides via YAML files. Initialize with:
         config = BaseConfig(dataset='adfecgdb')  # applies adfecgdb.yaml overrides
     """
@@ -109,12 +109,25 @@ class BaseConfig:
     # -- Random seed ----------------------------------------------------------
     RANDOM_SEED = 42
     HR_SEP_MIN_BPM = 15
+
+    # -- Path selection -------------------------------------------------------
+    # Used as a SCORE multiplier in Step 9 of pipeline.py (not a peak-count
+    # ratio — see [FIX-PATH-1] in pipeline.py). Path A is chosen when:
+    #   a_score >= b_score * PATH_A_PREFERENCE
+    # Default 1.5: gives Path A a mild advantage on ADFECGDB long recordings.
+    # Override to 1.0 in cinc2013.yaml for a pure score comparison.
     PATH_A_PREFERENCE = 1.5
+
+    # -- Confidence gate ------------------------------------------------------
+    # When chosen_ic_selection_score < CONFIDENCE_GATE_THRESHOLD, the result
+    # is flagged as low_confidence=True in metadata. Does not suppress output.
+    # Override per-dataset in YAML. See [FIX-PATH-2] in pipeline.py.
+    CONFIDENCE_GATE_THRESHOLD = 0.05
 
     def __init__(self, dataset: str = "adfecgdb"):
         """
         Initialize BaseConfig. Optionally apply dataset-specific YAML overrides.
-        
+
         Parameters
         ----------
         dataset : str
@@ -123,7 +136,7 @@ class BaseConfig:
         self.dataset = dataset.lower()
         self._load_overrides()
         np.random.seed(self.RANDOM_SEED)
-        
+
         # FIX 3: Compute EVAL_MIN_PEAK_DISTANCE_SEC dynamically from FETAL_HR_MAX
         # Minimum peak distance = minimum RR interval = 60 sec / max HR
         if self.EVAL_MIN_PEAK_DISTANCE_SEC is None:
@@ -138,7 +151,7 @@ class BaseConfig:
         if override_file.exists():
             with open(override_file, 'r') as f:
                 overrides = yaml.safe_load(f) or {}
-            
+
             # Apply overrides to this config instance
             for key, value in overrides.items():
                 setattr(self, key.upper(), value)
