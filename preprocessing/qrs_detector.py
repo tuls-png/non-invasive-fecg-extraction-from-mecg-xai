@@ -45,11 +45,6 @@ CHANGES (per codebase review)
    - Added initialize_qrs_detector(dataset) for global module configuration.
    - detect_fetal_qrs() and detect_reference_fetal_qrs() now accept optional
      config parameter for per-call dataset overrides.
-
-5. [FIX-ANNOTOMALY] compute_annotation_sanity(): new utility that checks
-   whether a reference annotation is plausibly dense given the recording
-   duration and expected fetal HR range. Called by pipeline.py [FIX-PATH-4]
-   to flag recordings like CinC2013/a54 (37 reference beats in 60 s).
 """
 
 import struct
@@ -80,13 +75,13 @@ def initialize_qrs_detector(dataset: str = "adfecgdb"):
     """
     Initialize QRS detector with dataset-specific configuration.
     Call this before processing to load dataset-specific values from YAML.
-
+    
     Parameters
     ----------
     dataset : str
         Dataset name ('adfecgdb', 'cinc2013', 'nifecgdb', etc.).
         Loads dataset.yaml if it exists and applies overrides to module globals.
-
+    
     Examples
     --------
     >>> initialize_qrs_detector("cinc2013")  # Uses cinc2013.yaml values
@@ -96,9 +91,9 @@ def initialize_qrs_detector(dataset: str = "adfecgdb"):
     global PT_FETAL_BANDPASS_LOW, PT_FETAL_BANDPASS_HIGH, PT_FETAL_BANDPASS_ORDER
     global PT_INTEGRATION_WINDOW_SEC, PT_THRESHOLD_FACTOR
     global FETAL_HR_MIN, FETAL_HR_MAX
-
+    
     _cfg = BaseConfig(dataset=dataset)
-
+    
     # Update all module-level variables from the new config
     FS = _cfg.FS
     PT_MATERNAL_BANDPASS_LOW = _cfg.PT_MATERNAL_BANDPASS_LOW
@@ -122,7 +117,7 @@ def _pt_integrate(signal: np.ndarray, fs: int,
     bandpass → differentiate → square → moving-window integrate.
     Returns the integrated signal ready for peak detection.
     Uses order-2 Butterworth for adequate stopband rejection.
-
+    
     Parameters
     ----------
     signal : input signal
@@ -135,7 +130,7 @@ def _pt_integrate(signal: np.ndarray, fs: int,
         integration_window = PT_INTEGRATION_WINDOW_SEC
     else:
         integration_window = cfg.PT_INTEGRATION_WINDOW_SEC
-
+    
     nyq      = 0.5 * fs
     b, a     = butter(2, [bp_low / nyq, bp_high / nyq], btype='band')  # FIX: order 2
     filtered = filtfilt(b, a, signal)
@@ -193,7 +188,7 @@ def detect_maternal_qrs(maternal_ic: np.ndarray, fs: int = FS, cfg: BaseConfig =
 
     Uses the maternal bandpass (5–15 Hz, standard adult QRS band).
     Maternal HR range: 50–115 BPM (or dataset-specific if cfg provided).
-
+    
     Parameters
     ----------
     maternal_ic : input signal
@@ -210,7 +205,7 @@ def detect_maternal_qrs(maternal_ic: np.ndarray, fs: int = FS, cfg: BaseConfig =
         bp_high = cfg.PT_MATERNAL_BANDPASS_HIGH
         min_hr_bpm = cfg.MATERNAL_HR_MIN
         max_hr_bpm = cfg.MATERNAL_HR_MAX
-
+    
     peaks, _ = pan_tompkins(
         maternal_ic, fs,
         min_hr_bpm=min_hr_bpm, max_hr_bpm=max_hr_bpm,
@@ -226,7 +221,7 @@ def detect_maternal_qrs(maternal_ic: np.ndarray, fs: int = FS, cfg: BaseConfig =
 def _pt_integrate_window(signal, fs, bp_low, bp_high, window_ms=80, cfg: BaseConfig = None):
     """
     Pan-Tompkins integration with custom window size.
-
+    
     Parameters
     ----------
     signal : input signal
@@ -244,47 +239,53 @@ def _pt_integrate_window(signal, fs, bp_low, bp_high, window_ms=80, cfg: BaseCon
     win = max(1, int(window_ms / 1000.0 * fs))
     return np.convolve(squared, np.ones(win) / win, mode='same')
 
-
 def detect_fetal_qrs(fetal_signal: np.ndarray, fs: int = FS,
-                      cfg: BaseConfig = None) -> np.ndarray:
+                      cfg: BaseConfig = None,
+                      force_low_threshold: bool = False) -> np.ndarray:
     """
     Detect fetal QRS peaks using adaptive Pan-Tompkins with HR gating.
 
     Parameters
     ----------
-    fetal_signal : (N,) input signal
-    fs : sampling rate (default from config)
-    cfg : BaseConfig, optional
-        Dataset-specific configuration. If provided, uses all fetal-specific
-        parameters from this config (PT_FETAL_BANDPASS_LOW/HIGH,
-        FETAL_HR_MIN/MAX, etc.). If None, uses module-level values (set via
-        initialize_qrs_detector).
+    fetal_signal        : (N,) input signal
+    fs                  : sampling rate (default from config)
+    cfg                 : BaseConfig, optional. If provided, uses dataset-
+                          specific parameters (PT_FETAL_BANDPASS_LOW/HIGH,
+                          FETAL_HR_MIN/MAX). If None, uses module-level values.
+    force_low_threshold : [FIX-RETRY] When True, the threshold search skips
+                          the high factors and starts directly from the
+                          sensitive range [0.08 .. 0.002]. Called by
+                          pipeline.py Step 11 when initial detection yields
+                          < 80% of expected beats. Recovers weak fetal beats
+                          in under-detected Type A failure recordings (a06,
+                          a11, a62) without globally lowering sensitivity.
 
     Returns
     -------
     np.ndarray — sample indices of detected QRS peaks
     """
-    # Use provided config or fall back to module level
     if cfg is None:
-        fetal_hr_min = FETAL_HR_MIN
-        fetal_hr_max = FETAL_HR_MAX
-        bandpass_low = PT_FETAL_BANDPASS_LOW
+        fetal_hr_min  = FETAL_HR_MIN
+        fetal_hr_max  = FETAL_HR_MAX
+        bandpass_low  = PT_FETAL_BANDPASS_LOW
         bandpass_high = PT_FETAL_BANDPASS_HIGH
     else:
-        fetal_hr_min = cfg.FETAL_HR_MIN
-        fetal_hr_max = cfg.FETAL_HR_MAX
-        bandpass_low = cfg.PT_FETAL_BANDPASS_LOW
+        fetal_hr_min  = cfg.FETAL_HR_MIN
+        fetal_hr_max  = cfg.FETAL_HR_MAX
+        bandpass_low  = cfg.PT_FETAL_BANDPASS_LOW
         bandpass_high = cfg.PT_FETAL_BANDPASS_HIGH
 
-    print('fetal_hr_min', fetal_hr_min)
-    print('fetal_hr_max', fetal_hr_max)
-
-    best_peaks = np.array([])
-    best_score = -1
-    fallback_peaks = np.array([])
+    best_peaks       = np.array([])
+    best_score       = -1
+    fallback_peaks   = np.array([])
     fallback_hr_dist = np.inf
 
-    # Try multiple integration windows — shorter windows help high HR detection
+    # [FIX-RETRY] Skip high threshold factors when force_low_threshold=True
+    if force_low_threshold:
+        threshold_factors = [0.08, 0.03, 0.01, 0.005, 0.003, 0.002]
+    else:
+        threshold_factors = [0.50, 0.30, 0.15, 0.08, 0.03, 0.01, 0.005]
+
     for window_ms in [80, 50, 35]:
         integrated = _pt_integrate_window(
             fetal_signal, fs,
@@ -293,7 +294,7 @@ def detect_fetal_qrs(fetal_signal: np.ndarray, fs: int = FS,
         )
         min_dist = int((60.0 / fetal_hr_max) * fs)
 
-        for factor in [0.50, 0.30, 0.15, 0.08, 0.03, 0.01, 0.005]:
+        for factor in threshold_factors:
             threshold = np.mean(integrated) + factor * np.std(integrated)
             p, _ = find_peaks(integrated, height=threshold, distance=min_dist)
             if len(p) < 3:
@@ -345,7 +346,7 @@ def detect_reference_fetal_qrs(direct_signal: np.ndarray,
 
     Runs both the positive and negative signal through Pan-Tompkins, merges
     the results, and filters by HR plausibility.
-
+    
     Parameters
     ----------
     direct_signal : (N,) reference electrode signal
@@ -401,80 +402,22 @@ def detect_reference_fetal_qrs(direct_signal: np.ndarray,
     return best_peaks
 
 
-# ── Annotation sanity check ───────────────────────────────────────────────────
-
-def compute_annotation_sanity(ref_peaks: np.ndarray,
-                               duration_sec: float,
-                               cfg: BaseConfig = None,
-                               min_fraction: float = 0.5) -> dict:
-    """
-    [FIX-ANNOTOMALY] Check whether a reference annotation is plausibly dense.
-
-    A valid annotation should contain at least:
-        expected_min = duration_sec * FETAL_HR_MIN / 60 * min_fraction
-
-    beats. If the reference contains fewer, it is likely a partial annotation
-    (e.g. CinC2013/a54: 37 beats in 60 s at expected ~100–200 bpm → minimum
-    expected 50 beats at min_fraction=0.5; 37 < 50 → flagged).
-
-    Parameters
-    ----------
-    ref_peaks    : reference peak array
-    duration_sec : recording duration in seconds
-    cfg          : BaseConfig (uses FETAL_HR_MIN from config or module default)
-    min_fraction : fraction of expected minimum beats to use as threshold
-
-    Returns
-    -------
-    dict with keys:
-        is_sparse       : bool — True if annotation appears incomplete
-        n_ref_beats     : int — actual reference beat count
-        expected_min    : float — minimum expected beats
-        coverage_ratio  : float — n_ref_beats / (duration_sec * FETAL_HR_MIN / 60)
-    """
-    fetal_hr_min = cfg.FETAL_HR_MIN if cfg is not None else FETAL_HR_MIN
-    expected_at_min_hr = duration_sec * fetal_hr_min / 60.0
-    expected_min = expected_at_min_hr * min_fraction
-    n_ref = len(ref_peaks)
-    coverage = n_ref / (expected_at_min_hr + 1e-8)
-    is_sparse = n_ref < expected_min
-
-    if is_sparse:
-        print(f"[ANNOT-SANITY] SPARSE annotation: {n_ref} beats "
-              f"< expected minimum {expected_min:.0f} "
-              f"(coverage ratio = {coverage:.2f}, "
-              f"duration = {duration_sec:.1f}s, "
-              f"fetal_hr_min = {fetal_hr_min} bpm) "
-              f"— metrics for this recording may be unreliable")
-    else:
-        print(f"[ANNOT-SANITY] Annotation OK: {n_ref} beats "
-              f"(coverage ratio = {coverage:.2f})")
-
-    return {
-        "is_sparse"     : is_sparse,
-        "n_ref_beats"   : n_ref,
-        "expected_min"  : float(expected_min),
-        "coverage_ratio": float(coverage),
-    }
-
-
 # ── ADFECGDB / NIFECGDB ground truth loader ──────────────────────────────────
-
 def compute_hr_from_samples(peaks, fs):
     if len(peaks) < 2:
         return np.nan
+
     rr_samples = np.diff(peaks)
     rr_sec = rr_samples / fs
+
     hr = 60.0 / np.mean(rr_sec)
     return hr
-
 
 def load_adfecgdb_annotation(ann_path: str):
     file_path = ann_path[:-4]
     ann = wfdb.rdann(file_path, 'qrs')
     peaks = ann.sample
     return peaks
-
 
 def load_wfdb_annotation(record_stem: str, extension: str = 'qrs') -> np.ndarray:
     """
@@ -497,14 +440,12 @@ def load_wfdb_annotation(record_stem: str, extension: str = 'qrs') -> np.ndarray
     """
     ann = wfdb.rdann(record_stem, extension)
     return ann.sample
-
-
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def compute_hr_stats(peaks: np.ndarray, fs: int = FS, cfg: BaseConfig = None) -> dict:
     """
     Compute heart rate statistics from detected peaks.
-
+    
     Parameters
     ----------
     peaks : array of peak indices

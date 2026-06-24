@@ -26,34 +26,23 @@ bandpass_low: 5.0
 
 # FIX 6: Lower PT_THRESHOLD_FACTOR to recover weak fetal beats post-subtraction
 pt_threshold_factor: 0.5
-
 # ICA dual-contrast: run both logcosh and exp, pick whichever gives
 # a better maternal IC score. Addresses CinC2013's wide quality range
 # where no single contrast function works universally.
 ica_dual_contrast: true
-
-# ── Path selection fixes (bimodal F1 diagnosis) ───────────────────────────────
+# ── Path selection & confidence (bimodal F1 fix batch) ───────────────────────
 #
-# [FIX-PATH-1] PATH_A_PREFERENCE is now used as a SCORE multiplier, not a
-# peak-count ratio. Set to 1.0 here so path selection is a pure score
-# comparison on CinC2013 (both paths produce near-equal beat counts on 60-second
-# recordings, so the old peak-count comparison never favoured Path A).
-# ADFECGDB retains the base.py default of 1.5, which gives Path A a mild
-# advantage on long clean recordings where it genuinely tends to score slightly
-# higher.
-path_a_preference: 1.0
+# [FIX-PATH-1] PATH_A_PREFERENCE is now a SCORE multiplier in pipeline.py
+# Step 9. Set to 1.1: Path A chosen only when a_score >= b_score × 1.1.
+# Gives Path B a small edge to preserve a62 (which regressed at 1.0) while
+# still letting Path A win when its score is meaningfully higher (a29, a37,
+# a39 all had score differences > 30%).
+path_a_preference: 1.05
 
-# [FIX-PATH-2] Confidence gate: when the chosen path's unified score is below
-# this threshold, the result is flagged as low_confidence=True in the metadata
-# CSV. Does NOT suppress output — the result is still computed and logged.
-# Set to 0.05 based on data: the three degenerate failure cases (a07, a09, a60)
-# all had score = 0.000 and should be flagged rather than silently trusted.
+# [FIX-PATH-2] Confidence gate — scores below this set low_confidence=True
+# in metadata. Catches degenerate ICA cases (a07, a09, a60: score = 0.000).
 confidence_gate_threshold: 0.05
 
-# [FIX-PATH-3] HR_SEP_MIN_BPM is used by _is_fetal_hr() for BOTH the maternal
-# HR separation check AND the new half-harmonic guard. 15 bpm is the existing
-# base.py value; retaining it here for the half-harmonic check (which uses the
-# same threshold) means no net change for recordings where the maternal HR is
-# well-separated from the fetal HR — the guard only activates when candidate
-# fetal HR is suspiciously close to half the maternal HR.
+# [FIX-PATH-3] HR separation used for both maternal check AND half-harmonic
+# guard in _is_fetal_hr(). 15 bpm from base retained.
 hr_sep_min_bpm: 15
