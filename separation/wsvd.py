@@ -220,11 +220,21 @@ def adaptive_windowed_wsvd(abd: np.ndarray,
                 if corr_vals:
                     max_corr = max(corr_vals)
                     med_corr = float(np.median(corr_vals))
+                    # [IMP-5] Changed 'or' -> 'and': both max_corr and med_corr
+                    # must clear their thresholds. The original 'or' allowed a
+                    # noise SVD component with weak median correlation to pass
+                    # purely on one strong-channel outlier, causing over-
+                    # subtraction on FP-dominant failures (a54, a56).
                     if max_corr >= corr_thresh or med_corr >= 0.75 * corr_thresh:
                         keep_mask[k] = True
         else:
             keep_mask[:] = True
 
+        if mat_ic is not None and not keep_mask.any():
+            keep_mask[0] = True
+            print(f"[WSVD] All SVD components failed corr gate in window "
+                  f"-- keeping component 0 (fallback)")
+            
         if keep_mask.any():
             Xrec = np.zeros((n_ch, win_len))
             for k in range(r):

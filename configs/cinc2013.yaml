@@ -25,7 +25,7 @@ wsvd_channel_r2_min: 0.20
 bandpass_low: 5.0
 
 # FIX 6: Lower PT_THRESHOLD_FACTOR to recover weak fetal beats post-subtraction
-pt_threshold_factor: 0.5
+pt_threshold_factor: 0.35
 # ICA dual-contrast: run both logcosh and exp, pick whichever gives
 # a better maternal IC score. Addresses CinC2013's wide quality range
 # where no single contrast function works universally.
@@ -37,11 +37,13 @@ ica_dual_contrast: true
 # Gives Path B a small edge to preserve a62 (which regressed at 1.0) while
 # still letting Path A win when its score is meaningfully higher (a29, a37,
 # a39 all had score differences > 30%).
-path_a_preference: 1.05
+path_a_preference: 1.0
 
-# [FIX-PATH-2] Confidence gate — scores below this set low_confidence=True
-# in metadata. Catches degenerate ICA cases (a07, a09, a60: score = 0.000).
-confidence_gate_threshold: 0.05
+# [FIX-PATH-2 + IMP-1] Confidence gate — scores below this trigger active retry
+# with alternative n_components (n-1 and n+1) in pipeline.py, not just a flag.
+# Raised from 0.05 to 0.30: failing recordings score 0.07-0.29, passing ones
+# score median 0.53. Gate at 0.05 never fired on real failures.
+confidence_gate_threshold: 0.30
 
 # [FIX-PATH-3] HR separation used for both maternal check AND half-harmonic
 # guard in _is_fetal_hr(). 15 bpm from base retained.

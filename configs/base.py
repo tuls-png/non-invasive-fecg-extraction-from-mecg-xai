@@ -114,7 +114,7 @@ class BaseConfig:
     # Used as SCORE multiplier in Step 9 [FIX-PATH-1]:
     #   Path A chosen when a_score >= b_score * PATH_A_PREFERENCE
     # Default 1.5 for ADFECGDB. cinc2013.yaml overrides to 1.1.
-    PATH_A_PREFERENCE = 1.5
+    PATH_A_PREFERENCE = 1.0
 
     # -- Confidence gate ------------------------------------------------------
     # chosen_ic_selection_score < threshold → low_confidence=True in metadata.
