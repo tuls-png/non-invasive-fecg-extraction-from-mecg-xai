@@ -92,7 +92,6 @@ class BaseConfig:
     # -- Evaluation ---------------------------------------------------------------
     EVAL_TOLERANCE_MS = 50
     EVAL_MIN_PEAK_HEIGHT = 0.35
-    # FIX 3: EVAL_MIN_PEAK_DISTANCE_SEC derived from 60/FETAL_HR_MAX (set in __init__)
     EVAL_MIN_PEAK_DISTANCE_SEC = None  # Computed dynamically in __init__
 
     # -- ECHO XAI -----------------------------------------------------------------
@@ -111,14 +110,13 @@ class BaseConfig:
     HR_SEP_MIN_BPM = 15
 
     # -- Path selection -------------------------------------------------------
-    # Used as SCORE multiplier in Step 9 [FIX-PATH-1]:
+    # Used as SCORE multiplier in Step 9:
     #   Path A chosen when a_score >= b_score * PATH_A_PREFERENCE
     # Default 1.5 for ADFECGDB. cinc2013.yaml overrides to 1.1.
     PATH_A_PREFERENCE = 1.0
 
     # -- Confidence gate ------------------------------------------------------
     # chosen_ic_selection_score < threshold → low_confidence=True in metadata.
-    # [FIX-PATH-2]. Does not suppress output.
     CONFIDENCE_GATE_THRESHOLD = 0.05
 
     def __init__(self, dataset: str = "adfecgdb"):
@@ -134,7 +132,7 @@ class BaseConfig:
         self._load_overrides()
         np.random.seed(self.RANDOM_SEED)
         
-        # FIX 3: Compute EVAL_MIN_PEAK_DISTANCE_SEC dynamically from FETAL_HR_MAX
+        # Compute EVAL_MIN_PEAK_DISTANCE_SEC dynamically from FETAL_HR_MAX
         # Minimum peak distance = minimum RR interval = 60 sec / max HR
         if self.EVAL_MIN_PEAK_DISTANCE_SEC is None:
             self.EVAL_MIN_PEAK_DISTANCE_SEC = 60.0 / self.FETAL_HR_MAX

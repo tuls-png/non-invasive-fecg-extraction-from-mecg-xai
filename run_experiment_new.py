@@ -51,6 +51,7 @@ from utils.logger import ResultsLogger
 from utils.visualization import plot_ablation_results, plot_sota_comparison
 from phase_logger import PhaseLogger
 
+log_path = f"stdout_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
 def run_full_dataset(dataset_name: str, data_dir: str,
                      save_figures: bool = True,
@@ -76,7 +77,7 @@ def run_full_dataset(dataset_name: str, data_dir: str,
         print(f"[ERROR] No recordings found in {data_dir}")
         return []
 
-    pipe = PHASEPipeline(verbose=True, dataset=dataset_name)
+    pipe = PHASEPipeline(verbose=True, dataset=dataset_name, stdout_log_path=log_path)
 
     # ResultsLogger only accepts results_dir — use separate dirs so the two
     # CSVs (metrics and metadata) land in different folders and don't clash.
@@ -194,7 +195,7 @@ def run_ablation_dataset(dataset_name: str, data_dir: str,
     recordings = handler.load_all_recordings(
         data_dir, max_recordings=max_recordings)
 
-    pipe           = PHASEPipeline(verbose=True, dataset=dataset_name)
+    pipe           = PHASEPipeline(verbose=True, dataset=dataset_name, stdout_log_path=log_path)
     logger         = ResultsLogger(f"results_ablation_{dataset_name}")
     config_metrics = {}
 
@@ -256,7 +257,7 @@ def run_single_recording(dataset_name: str, filepath: str):
     rec    = handler.load_single_recording(filepath)
     handler.print_recording_summary(rec)
 
-    pipe   = PHASEPipeline(verbose=True, dataset=dataset_name)
+    pipe   = PHASEPipeline(verbose=True, dataset=dataset_name, stdout_log_path=log_path)
     result = pipe.run(rec, save_figures=True, figures_dir="figures")
 
     print("\nFinal Metrics:")

@@ -1,4 +1,0 @@
-timestamp,recording,method,SNR_dB,PRD_pct,RMSE,CC,Se,PPV,F1,TP,FP,FN,FHR_MAE_bpm,n_detected,n_reference,mean_fhr_bpm,std_fhr_bpm,pct_in_range,pct_smooth,fhr_plausible,SNR_before_dB,SNR_after_dB,delta_SNR_dB
-20260423_120711,ecgca102,PHASE_nifecgdb,,,,,0.0,0.0,0.0,0.0,412.0,0.0,,412.0,0.0,112.51,44.74,48.91,35.85,0.0,3.1141,-0.5031,-3.6171
-20260423_120711,ecgca115,PHASE_nifecgdb,,,,,0.0,0.0,0.0,0.0,1199.0,0.0,,1199.0,0.0,114.85,41.48,52.0,38.68,0.0,2.4296,-2.214,-4.6436
-20260423_120711,ecgca127,PHASE_nifecgdb,,,,,0.0,0.0,0.0,0.0,1524.0,0.0,,1524.0,0.0,134.31,29.17,72.09,68.53,0.0,1.6714,-4.6461,-6.3175

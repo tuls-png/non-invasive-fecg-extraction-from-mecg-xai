@@ -17,34 +17,17 @@ fetal_hr_high: 200
 fetal_hr_centre: 130
 ekf_fetal_hr_init: 140
 
-# FIX 2: Lower WSVD thresholds to trigger cancellation on high-maternal-SNR recordings
+# Lower WSVD thresholds to trigger cancellation on high-maternal-SNR recordings
 wsvd_component_corr_thresh: 0.15
 wsvd_channel_r2_min: 0.20
 
-# FIX 4: Change BANDPASS_LOW to 5.0 Hz to match ADFECGDB (avoid baseline drift)
+# Match ADFECGDB bandpass to avoid baseline drift
 bandpass_low: 5.0
 
-# FIX 6: Lower PT_THRESHOLD_FACTOR to recover weak fetal beats post-subtraction
+# Lower PT_THRESHOLD_FACTOR to recover weak fetal beats post-subtraction
 pt_threshold_factor: 0.35
-# ICA dual-contrast: run both logcosh and exp, pick whichever gives
-# a better maternal IC score. Addresses CinC2013's wide quality range
-# where no single contrast function works universally.
-ica_dual_contrast: true
-# ── Path selection & confidence (bimodal F1 fix batch) ───────────────────────
-#
-# [FIX-PATH-1] PATH_A_PREFERENCE is now a SCORE multiplier in pipeline.py
-# Step 9. Set to 1.1: Path A chosen only when a_score >= b_score × 1.1.
-# Gives Path B a small edge to preserve a62 (which regressed at 1.0) while
-# still letting Path A win when its score is meaningfully higher (a29, a37,
-# a39 all had score differences > 30%).
+
+# Path selection & confidence
 path_a_preference: 1.0
-
-# [FIX-PATH-2 + IMP-1] Confidence gate — scores below this trigger active retry
-# with alternative n_components (n-1 and n+1) in pipeline.py, not just a flag.
-# Raised from 0.05 to 0.30: failing recordings score 0.07-0.29, passing ones
-# score median 0.53. Gate at 0.05 never fired on real failures.
 confidence_gate_threshold: 0.30
-
-# [FIX-PATH-3] HR separation used for both maternal check AND half-harmonic
-# guard in _is_fetal_hr(). 15 bpm from base retained.
 hr_sep_min_bpm: 15

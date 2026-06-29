@@ -19,32 +19,6 @@ To use dataset-specific values from YAML:
 
 If a dataset YAML does not define FETAL_HR_MIN/MAX, base.py defaults are used.
 
-CHANGES (per codebase review)
-=============================
-1. Separated maternal and fetal Pan-Tompkins bandpass configurations.
-   - Maternal: 5–15 Hz (standard adult QRS band, order-2 Butterworth).
-   - Fetal:   10–40 Hz (fetal QRS is short-duration and broadband; using
-     5–15 Hz preferentially detects maternal energy that dominates ICA
-     components with residual maternal contamination).
-
-2. FIX — detect_fetal_qrs: added HR gating inside the adaptive threshold
-   loop. Previously the detector lowered its threshold until it found 200
-   peaks, keeping whichever threshold gave the most peaks regardless of
-   whether those peaks had a fetal-range heart rate. At very low thresholds
-   (factor=0.005) this detects T-waves and P-waves from residual maternal
-   signal, producing an apparent "HR" of 130–160 BPM that passes the fetal
-   HR filter downstream — the primary cause of the maternal-ECG extraction
-   failure. The loop now prefers solutions with HR inside FETAL_HR_MIN–MAX.
-
-3. FIX — Butterworth filter order raised from 1 → 2.
-   Order-1 has very poor roll-off (~20 dB/decade); order-2 gives much
-   better stopband rejection (~40 dB/decade) with minimal phase distortion
-   after the filtfilt zero-phase application.
-
-4. Enhanced config system support:
-   - Added initialize_qrs_detector(dataset) for global module configuration.
-   - detect_fetal_qrs() and detect_reference_fetal_qrs() now accept optional
-     config parameter for per-call dataset overrides.
 """
 
 import struct
@@ -62,7 +36,8 @@ FS = _cfg.FS
 PT_MATERNAL_BANDPASS_LOW = _cfg.PT_MATERNAL_BANDPASS_LOW
 PT_MATERNAL_BANDPASS_HIGH = _cfg.PT_MATERNAL_BANDPASS_HIGH
 PT_MATERNAL_BANDPASS_ORDER = _cfg.PT_MATERNAL_BANDPASS_ORDER
-PT_FETAL_BANDPASS_LOW = _cfg.PT_FETAL_BANDPASS_LOWPT_THRESHOLD_FACTOR
+PT_FETAL_BANDPASS_LOW = _cfg.PT_FETAL_BANDPASS_LOW
+PT_THRESHOLD_FACTOR   = _cfg.PT_THRESHOLD_FACTOR
 
 
 def initialize_qrs_detector(dataset: str = "adfecgdb"):
@@ -126,7 +101,7 @@ def _pt_integrate(signal: np.ndarray, fs: int,
         integration_window = cfg.PT_INTEGRATION_WINDOW_SEC
     
     nyq      = 0.5 * fs
-    b, a     = butter(2, [bp_low / nyq, bp_high / nyq], btype='band')  # FIX: order 2
+    b, a     = butter(2, [bp_low / nyq, bp_high / nyq], btype='band') 
     filtered = filtfilt(b, a, signal)
     diff     = np.gradient(filtered)
     squared  = diff ** 2
@@ -246,7 +221,7 @@ def detect_fetal_qrs(fetal_signal: np.ndarray, fs: int = FS,
     cfg                 : BaseConfig, optional. If provided, uses dataset-
                           specific parameters (PT_FETAL_BANDPASS_LOW/HIGH,
                           FETAL_HR_MIN/MAX). If None, uses module-level values.
-    force_low_threshold : [FIX-RETRY] When True, the threshold search skips
+    force_low_threshold : When True, the threshold search skips
                           the high factors and starts directly from the
                           sensitive range [0.08 .. 0.002]. Called by
                           pipeline.py Step 11 when initial detection yields
@@ -274,7 +249,6 @@ def detect_fetal_qrs(fetal_signal: np.ndarray, fs: int = FS,
     fallback_peaks   = np.array([])
     fallback_hr_dist = np.inf
 
-    # [FIX-RETRY] Skip high threshold factors when force_low_threshold=True
     if force_low_threshold:
         threshold_factors = [0.08, 0.03, 0.01, 0.005, 0.003, 0.002]
     else:
@@ -350,7 +324,7 @@ def detect_reference_fetal_qrs(direct_signal: np.ndarray,
     """
     def _pt_one_pass(sig, threshold_factor, min_dist_samples):
         nyq  = 0.5 * fs
-        b, a = butter(2, [5 / nyq, 20 / nyq], btype='band')   # FIX: order 2
+        b, a = butter(2, [5 / nyq, 20 / nyq], btype='band')
         filt = filtfilt(b, a, sig)
         diff = np.gradient(filt)
         sq   = diff ** 2

@@ -6,68 +6,6 @@ Dual-path fetal IC selection:
   Path A -- ICA1 Direct: best non-maternal IC from ICA1
   Path B -- WSVD + ICA2: best IC from ICA2 on WSVD residual
 
-CHANGES FROM ORIGINAL:
-  [FIX-1] Path B ICA2: exclude ICA2 components correlated with maternal IC
-          (|corr| > MATERNAL_ICA2_CORR_THRESH). Previously exclude_idx=-1
-          meant no exclusion, allowing residual-maternal ICs to be selected.
-  [FIX-2] min_usable_peaks is now recording-length-adaptive (was hardcoded 100).
-  [FIX-3] ECHO has_reference passed explicitly; None passed for NIFECGDB so
-          morphology score is disabled rather than self-referential.
-
-DISSERTATION MODIFICATIONS (unified, dataset-adaptive):
-  [MOD-1] _best_ic(): unified three-factor scoring replaces n_peaks x hr_score.
-          final_score = base_score x maternal_penalty x (1 + morphology_score)
-  [MOD-2] determine_n_components(): PCA-adaptive n_components before each ICA.
-          PCA floor raised 2->3: minimum 3 components for maternal/fetal/noise.
-  [MOD-3] ICA ensemble: N_ENSEMBLE=5 seeds. Stability-gated selection requires
-          winning IC to appear as top scorer in >= 2 seeds.
-  [MOD-4] adaptive_windowed_wsvd() receives duration_sec for adaptive windows.
-
-BIMODAL F1 FIX BATCH (targeting mean F1 > 85%):
-  [FIX-PATH-1] Score-based path selection: Step 9 now compares a_score vs
-          b_score x PATH_A_PREFERENCE instead of peak counts.
-
-  [FIX-PATH-2] Confidence gate: chosen_score < CONFIDENCE_GATE_THRESHOLD sets
-          low_confidence=True in metadata. Now triggers active retry with
-          different n_components when fired.
-
-  [FIX-PATH-3] Half-harmonic guard in _is_fetal_hr(): candidate rejected if
-          within HR_SEP_MIN_BPM of HALF the maternal HR.
-
-  [FIX-PATH-4] Annotation anomaly guard: n_reference < 50% expected minimum
-          sets sparse_annotation=True in metadata (catches a54).
-
-  [FIX-EKF]   EKF acceptance gate: peak count >= 70% AND CC >= 0.60 AND
-          |median_RR_post - median_RR_pre| <= 15ms. The CC and RR-shift
-          gates were documented but not implemented; now active.
-
-  [FIX-HARM]  Post-selection harmonic RR check: x1.0 and x2.0 only.
-
-  [FIX-RETRY] Under-detection retry: threshold changed from FETAL_HR_MIN-based
-          to FETAL_HR_CENTRE-based (65% of expected) so it fires on recordings
-          with 88-126 detected peaks that were previously missed.
-
-IMPROVEMENTS (v2):
-  [IMP-1] Raise CONFIDENCE_GATE_THRESHOLD in cinc2013.yaml to 0.30. When
-          low_confidence fires, retry with alternative n_components (n-1 and
-          n+1) and take the best result. Previously the gate was diagnostic-
-          only; now it drives active remediation.
-
-  [IMP-2] Cross-IC HR check after selection: if chosen IC HR is within
-          HR_SEP_MIN_BPM of maternal HR, force low_confidence=True and retry.
-          Fixes a02/a56 class failures where ICA1 misidentifies maternal IC
-          so the maternal component scores well in Path A and wins.
-
-  [IMP-3] Template-based morphology score: compute correlation of each beat
-          window against the mean-beat template (O(n)) instead of 20 random
-          pairs. More stable on weak fetal signals.
-
-  [IMP-4] Fix ensemble fallback seed: ENSEMBLE_SEEDS=[0,1,2,3,4] but fallback
-          tried seed=42 which is never in the pool. Changed to seed=0.
-
-  [IMP-5] WSVD corr gate: changed 'or med_corr >= 0.75*corr_thresh' to
-          'and' to prevent noise SVD components from passing on median alone.
-          (Change is in wsvd.py; documented here for traceability.)
 """
 
 import sys
@@ -106,7 +44,7 @@ MORPHOLOGY_MIN_PEAKS  = 5
 MORPHOLOGY_WIN_SEC    = 0.3
 STABILITY_LOG_THRESH  = 0.7
 
-# [FIX-PATH-2] default confidence gate — overridden by cinc2013.yaml
+
 _DEFAULT_CONFIDENCE_GATE = 0.05
 
 
@@ -136,7 +74,7 @@ def _is_fetal_hr(mean_hr: float, maternal_hr: float, cfg) -> bool:
     Check if a candidate HR is in the fetal range and sufficiently
     separated from maternal HR.
 
-    [FIX-PATH-3] Half-harmonic guard: candidate rejected if within
+   Half-harmonic guard: candidate rejected if within
     HR_SEP_MIN_BPM of HALF the maternal HR.
     """
     if np.isnan(mean_hr):
@@ -165,7 +103,7 @@ def _hr_score(mean_hr, cfg, expected_hr=None):
 
 
 def _find_maternal_residual_idx(ICs, maternal_ic, cfg):
-    """[FIX-1] Find ICA2 component most correlated with maternal IC."""
+    """ Find ICA2 component most correlated with maternal IC."""
     best_idx  = -1
     best_corr = cfg.MATERNAL_ICA2_CORR_THRESH
     for i, ic in enumerate(ICs):
@@ -190,7 +128,7 @@ def _check_harmonic_confusion(chosen_peaks: np.ndarray,
                                fs: int,
                                tolerance: float = 0.10) -> bool:
     """
-    [FIX-HARM] Check whether chosen IC RR matches maternal harmonic at
+   Check whether chosen IC RR matches maternal harmonic at
     x1.0 or x2.0 only. x0.5 excluded — equals fetal RR when fetal ~2x maternal.
     """
     if len(chosen_peaks) < 3 or np.isnan(maternal_hr) or maternal_hr <= 0:
@@ -202,7 +140,7 @@ def _check_harmonic_confusion(chosen_peaks: np.ndarray,
     for harmonic_rr in [maternal_rr, maternal_rr * 2.0]:
         if harmonic_rr > 0:
             if abs(chosen_rr - harmonic_rr) / harmonic_rr < tolerance:
-                print(f"[FIX-HARM] Harmonic confusion suspected: "
+                print(f"Harmonic confusion suspected: "
                       f"chosen RR={chosen_rr*1000:.0f}ms, "
                       f"harmonic RR={harmonic_rr*1000:.0f}ms "
                       f"(maternal HR={maternal_hr:.1f}bpm, "
@@ -211,14 +149,13 @@ def _check_harmonic_confusion(chosen_peaks: np.ndarray,
     return False
 
 
-# ── [MOD-2] PCA-adaptive n_components ────────────────────────────────────────
 
 def determine_n_components(signals: np.ndarray,
                             variance_threshold: float = PCA_VARIANCE_THRESHOLD,
                             n_min: int = PCA_N_MIN,
                             n_max: int = PCA_N_MAX,
                             label: str = "") -> int:
-    """[MOD-2] Count PCA components explaining >= variance_threshold, clip to [n_min, n_max]."""
+    """Count PCA components explaining >= variance_threshold, clip to [n_min, n_max]."""
     try:
         _, S, _ = np.linalg.svd(signals, full_matrices=False)
         var_ratio = (S ** 2) / (np.sum(S ** 2) + 1e-12)
@@ -233,12 +170,11 @@ def determine_n_components(signals: np.ndarray,
     return n_comp
 
 
-# ── [MOD-1] Unified three-factor IC scoring ───────────────────────────────────
 
 def _morphology_score(sig: np.ndarray, peaks: np.ndarray,
                       fs: int, win_sec: float = MORPHOLOGY_WIN_SEC) -> float:
     """
-    [IMP-3] Template-based morphology score.
+    
 
     Compute correlation of each beat window against the mean-beat template
     (O(n)) instead of 20 random pairs. More stable on weak fetal signals
@@ -261,7 +197,7 @@ def _morphology_score(sig: np.ndarray, peaks: np.ndarray,
     if len(windows) < 2:
         return 0.0
 
-    # [IMP-3] template-based: correlate each beat against the mean template
+   
     min_len  = min(len(w) for w in windows)
     arr      = np.array([w[:min_len] for w in windows])
     template = np.mean(arr, axis=0)
@@ -284,7 +220,7 @@ def _maternal_penalty(ic: np.ndarray,
                       fs: int,
                       path_b_half_weight: bool = False) -> float:
     """
-    [MOD-1] Maternal leakage penalty factor.
+   Maternal leakage penalty factor.
     penalty = 1 - max(|corr(IC, maternal_IC)|, |corr(IC, synthetic_maternal_harmonic)|)
     Path B flag halves the penalty weight.
     """
@@ -321,7 +257,7 @@ def _score_ic_unified(ic: np.ndarray,
                       fs: int,
                       path_b: bool = False) -> float:
     """
-    [MOD-1] Unified three-factor fetal IC scoring:
+    Unified three-factor fetal IC scoring:
         final_score = base_score x maternal_penalty x (1 + morphology_score)
     """
     base    = score_fetal_ic(ic, maternal_peaks, fs)
@@ -331,15 +267,13 @@ def _score_ic_unified(ic: np.ndarray,
     return float(base * mat_pen * (1.0 + morph))
 
 
-# ── [MOD-3] Ensemble _best_ic ─────────────────────────────────────────────────
-
 def _best_ic(ICs_or_signals, exclude_idx, maternal_hr, fs, cfg,
              label="", expected_hr=None, min_peaks=100,
              maternal_ic=None, maternal_peaks=None,
              path_b=False,
              n_components=None):
     """
-    [MOD-1 + MOD-3] Select best fetal IC using unified three-factor score.
+    Select best fetal IC using unified three-factor score.
     For backward compatibility with run_with_ablation().
     """
     centre     = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
@@ -409,14 +343,12 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
                       maternal_ic=None, maternal_peaks=None,
                       path_b=False, n_components=None):
     """
-    [MOD-3] ICA ensemble wrapper for _best_ic.
+    ICA ensemble wrapper for _best_ic.
 
     Runs FastICA N_ENSEMBLE times with seeds ENSEMBLE_SEEDS (0-4).
-    All N*k IC candidates are scored with the three-factor formula from [MOD-1].
+    All N*k IC candidates are scored with the three-factor formula from .
     The global winner across all runs is returned.
 
-    [IMP-4] Fixed fallback seed: was 42 (never in ENSEMBLE_SEEDS=[0..4]),
-    now falls back to seed=0 which is always in the pool.
     """
     if n_components is None:
         n_components = PCA_N_MAX
@@ -499,9 +431,7 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
     valid = [c for c in all_candidates
              if c["passes_hr"] and c["n_peaks"] >= min_peaks]
 
-    # [IMP-1] For low-confidence situations: also try force_low_threshold on
-    # HR-failing candidates so a valid IC with under-detected peaks gets a
-    # second chance before we fall back to the score-max
+    
     if not valid:
         print(f"[ENSEMBLE] {label}: no candidate passed HR filter -- "
               f"retrying with force_low_threshold on each candidate...")
@@ -548,7 +478,7 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
             print(f"[ENSEMBLE-STABLE] {label}: ic_idx={best['ic_idx']} "
                   f"won in {win_counts[best['ic_idx']]}/{len(ENSEMBLE_SEEDS)} seeds")
     else:
-        # [IMP-4] Fixed fallback: use seed=0 (was seed=42, never in pool)
+     
         seed0_pool = [c for c in pool if c["seed"] == 0]
         if seed0_pool:
             best = max(seed0_pool, key=lambda c: c["unified"])
@@ -614,7 +544,7 @@ def _best_ic_ensemble_with_retry(mixed_signals, exclude_idx, maternal_hr, fs, cf
                                   maternal_ic=None, maternal_peaks=None,
                                   path_b=False, n_components=None):
     """
-    [IMP-1] Wrapper around _best_ic_ensemble that retries with alternative
+   Wrapper around _best_ic_ensemble that retries with alternative
     n_components when the result is low-confidence.
 
     Tries n_components, n_components-1 (if >= PCA_N_MIN), and
@@ -684,16 +614,12 @@ def _refine_peaks_on_smoothed(smoothed, rough_peaks, fs, search_radius_ms=40.0):
 
 def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts, cfg=None):
     """
-    [FIX-EKF] EKF acceptance gate: ALL THREE gates must pass:
+   EKF acceptance gate: ALL THREE gates must pass:
       (a) post-EKF peak count >= 70% of pre-EKF
-      (b) CC(ekf_output, pre_ekf_input) >= 0.60   [NOW ACTIVE - was documented but missing]
-      (c) |median_RR_post - median_RR_pre| <= 15ms [NOW ACTIVE - was documented but missing]
+      (b) CC(ekf_output, pre_ekf_input) >= 0.60  
+      (c) |median_RR_post - median_RR_pre| <= 15ms
 
-    Gate (b) and (c) were listed in ekf.py docstring but never implemented
-    in the actual gate check in this function. Now active.
-    Gate (c) catches phase-shifted EKF output: a 30ms shift preserves peak
-    count (gate a passes) and gives CC ~0.997 on 60s signal (gate b passes)
-    but shifts the beat rhythm detectably (gate c catches it).
+ 
     """
     if len(fetal_peaks) < 5:
         return fetal_ic, False
@@ -734,16 +660,32 @@ def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts, cfg=None):
 
 class PHASEPipeline:
     def __init__(self, fs=None, use_rts=True, ekf_bypass=False, verbose=True,
-                 dataset=None):
+                 dataset=None, stdout_log_path=None):
         self.cfg        = get_config(dataset)
         self.fs         = fs if fs is not None else self.cfg.FS
         self.use_rts    = use_rts
         self.ekf_bypass = ekf_bypass
         self.verbose    = verbose
+        self._log_file  = None
+        if stdout_log_path is not None:
+            self._log_file = open(stdout_log_path, "a", encoding="utf-8", buffering=1)
+
+    def __del__(self):
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
 
     def _log(self, msg):
+        line = f"[PHASE] {msg}"
         if self.verbose:
-            print(f"[PHASE] {msg}")
+            print(line)
+        if self._log_file is not None:
+            try:
+                self._log_file.write(line + "")
+            except Exception:
+                pass
 
     def run(self, recording, save_figures=False, figures_dir="figures"):
         cfg      = self.cfg
@@ -848,7 +790,7 @@ class PHASEPipeline:
                   f"stability={b_stability:.3f}, score={b_score:.4f}")
 
         # Step 9: Select best path
-        self._log("Step 9: Selecting best path (score-based [FIX-PATH-1])...")
+        self._log("Step 9: Selecting best path (score-based )...")
         if a_valid and b_valid:
             if a_score >= b_score * cfg.PATH_A_PREFERENCE:
                 chosen_sig, chosen_peaks = a_sig, a_peaks
@@ -880,8 +822,6 @@ class PHASEPipeline:
 
         chosen_score = a_score if "A_" in chosen_path else b_score
         chosen_hr    = a_hr    if "A_" in chosen_path else b_hr
-
-        # [FIX-PATH-2 + IMP-1] Confidence gate (now active, not diagnostic-only)
         confidence_gate = getattr(cfg, "CONFIDENCE_GATE_THRESHOLD",
                                   _DEFAULT_CONFIDENCE_GATE)
         low_confidence = chosen_score < confidence_gate
@@ -889,9 +829,7 @@ class PHASEPipeline:
             self._log(f"  *** LOW CONFIDENCE *** score={chosen_score:.4f} "
                       f"< gate={confidence_gate} -- flagged (retry already attempted in ensemble)")
 
-        # [IMP-2] Cross-IC HR check: if chosen HR is within HR_SEP_MIN_BPM of
-        # maternal HR, ICA1 likely misidentified the maternal component and the
-        # chosen IC is a maternal residual. Force low_confidence and retry.
+        
         hr_sep = getattr(cfg, "HR_SEP_MIN_BPM", 15.0)
         if (not np.isnan(chosen_hr) and not np.isnan(maternal_hr) and
                 abs(chosen_hr - maternal_hr) < hr_sep):
@@ -935,8 +873,6 @@ class PHASEPipeline:
             chosen_sig, chosen_peaks = best_spec_sig, best_spec_peaks
             self._log(f"  Spectral fallback selected: {chosen_path} "
                       f"(band_ratio={best_spec_ratio:.4f})")
-            
-        # [FIX-HARM] Harmonic confusion check
         harmonic_confusion = _check_harmonic_confusion(
             chosen_peaks, maternal_hr, fs)
         if harmonic_confusion:
@@ -966,8 +902,6 @@ class PHASEPipeline:
                     self._log(f"  RR CV improved: {rr_cv:.3f} -> {cv_rerun:.3f}, "
                               f"peaks {len(chosen_peaks)} -> {len(peaks_rerun)}")
                     chosen_peaks = peaks_rerun
-
-        # Step 10: EKF-RTS [FIX-EKF: all three gates now active]
         self._log("Step 10: EKF-RTS morphological refinement [gates: peak_ratio+CC+RR_shift]...")
         fetal_ic_raw = chosen_sig
         ekf_used     = False
@@ -987,31 +921,8 @@ class PHASEPipeline:
                 self._log(f"  EKF accepted -- {n_post} peaks post-EKF "
                           f"(was {len(chosen_peaks)})")
 
-        # Step 11: Final QRS detection + [FIX-RETRY] under-detection retry
+        # Step 11: Final QRS detection +  under-detection retry
         self._log("Step 11: Final fetal QRS detection...")
-        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
-
-        # [FIX-RETRY] Tighter threshold: use FETAL_HR_CENTRE-based expected count
-        # at 65% (was FETAL_HR_MIN at 80% -- too loose, missed 88-126 peak cases).
-        expected_beats  = duration * cfg.FETAL_HR_CENTRE / 60.0
-        detection_rate  = len(fetal_peaks) / (expected_beats + 1e-10)
-        if detection_rate < 0.82 and len(fetal_peaks) < expected_beats * 0.82:
-            self._log(f"  Under-detection: {len(fetal_peaks)} peaks, "
-                      f"rate={detection_rate:.2f} < 0.72 "
-                      f"-- retrying with relaxed threshold...")
-            fetal_peaks_retry = detect_fetal_qrs(
-                fetal_ecg, fs, cfg=cfg, force_low_threshold=True)
-            if len(fetal_peaks_retry) > len(fetal_peaks):
-                self._log(f"  Retry recovered: "
-                          f"{len(fetal_peaks_retry)} peaks "
-                          f"(was {len(fetal_peaks)})")
-                fetal_peaks = fetal_peaks_retry
-
-        fet_hr = compute_hr_stats(fetal_peaks, fs)
-        self._log(f"  {len(fetal_peaks)} peaks, HR = {fet_hr['mean_hr']:.1f} BPM")
-
-        # Step 12: Evaluation
-        self._log("Step 12: Evaluation...")
         if ann_path and ann_is_fetal:
             ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
             self._log(f"  Reference: .{ann_ext} annotation -- {len(ref_peaks)} peaks")
@@ -1021,8 +932,53 @@ class PHASEPipeline:
         else:
             ref_peaks = np.array([])
             self._log("  Reference: none available")
+        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
 
-        # [FIX-PATH-4] Annotation anomaly guard
+       
+        _n_ref = len(ref_peaks) if len(ref_peaks) > 10 else int(
+            duration * cfg.FETAL_HR_CENTRE / 60.0)
+        _det_ratio  = len(fetal_peaks) / (_n_ref + 1e-10)
+        _fp_est     = max(0.0, len(fetal_peaks) - _n_ref) / (len(fetal_peaks) + 1e-10)
+        _retry_trigger = (_det_ratio < 0.90) or (_fp_est > 0.25)
+
+        if _retry_trigger:
+            self._log(f"  Retry trigger: det/ref={_det_ratio:.3f}, "
+                      f"est_fp_rate={_fp_est:.2f} "
+                      f"({'under-detection' if _det_ratio < 0.90 else 'over-detection'}) "
+                      f"-- retrying with narrow-band force_low_threshold...")
+            fetal_peaks_retry = detect_fetal_qrs(
+                fetal_ecg, fs, cfg=cfg, force_low_threshold=True)
+            _retry_ratio = len(fetal_peaks_retry) / (_n_ref + 1e-10)
+            # Only accept retry if it moved the det/ref ratio closer to 1.0
+            if abs(_retry_ratio - 1.0) < abs(_det_ratio - 1.0):
+                self._log(f"  Retry accepted: {len(fetal_peaks_retry)} peaks "
+                          f"(was {len(fetal_peaks)}), "
+                          f"new det/ref={_retry_ratio:.3f}")
+                fetal_peaks = fetal_peaks_retry
+            else:
+                self._log(f"  Retry rejected: {len(fetal_peaks_retry)} peaks "
+                          f"would worsen det/ref ({_retry_ratio:.3f} vs {_det_ratio:.3f})")
+
+        fet_hr = compute_hr_stats(fetal_peaks, fs)
+        self._log(f"  {len(fetal_peaks)} peaks, HR = {fet_hr['mean_hr']:.1f} BPM")
+        n_before_merge = len(fetal_peaks)
+        if len(fetal_peaks) > 2:
+            merge_radius = int(0.080 * fs)
+            merged = [int(fetal_peaks[0])]
+            for p in fetal_peaks[1:]:
+                if int(p) - merged[-1] < merge_radius:
+                    if abs(float(chosen_sig[int(p)])) > abs(float(chosen_sig[merged[-1]])):
+                        merged[-1] = int(p)
+                else:
+                    merged.append(int(p))
+            fetal_peaks = np.array(merged, dtype=int)
+        if len(fetal_peaks) != n_before_merge:
+            self._log(f"  Peak merging: {n_before_merge} -> {len(fetal_peaks)} peaks "
+                      f"({n_before_merge - len(fetal_peaks)} doublets collapsed)")
+            
+
+        # Step 12: Evaluation
+        self._log("Step 12: Evaluation...")   
         sparse_annotation = False
         if len(ref_peaks) > 0:
             expected_min_ref = duration * cfg.FETAL_HR_MIN / 60.0 * 0.5
