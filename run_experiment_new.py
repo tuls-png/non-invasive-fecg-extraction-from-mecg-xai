@@ -38,6 +38,7 @@ matplotlib.use('Agg')
 import sys
 import argparse
 import numpy as np
+import yaml
 from pathlib import Path
 from datetime import datetime
 
@@ -52,6 +53,118 @@ from utils.visualization import plot_ablation_results, plot_sota_comparison
 from phase_logger import PhaseLogger
 
 log_path = f"stdout_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+
+def build_tuning_candidates(dataset_name: str):
+    """Build a small deterministic set of candidate hyperparameter values."""
+    dataset_name = (dataset_name or "").lower()
+    if dataset_name == "cinc2013":
+        return [
+            {
+                "WSVD_COMPONENT_CORR_THRESH": 0.12,
+                "WSVD_CHANNEL_R2_MIN": 0.18,
+                "PT_THRESHOLD_FACTOR": 0.30,
+            },
+            {
+                "WSVD_COMPONENT_CORR_THRESH": 0.15,
+                "WSVD_CHANNEL_R2_MIN": 0.20,
+                "PT_THRESHOLD_FACTOR": 0.35,
+            },
+            {
+                "WSVD_COMPONENT_CORR_THRESH": 0.18,
+                "WSVD_CHANNEL_R2_MIN": 0.25,
+                "PT_THRESHOLD_FACTOR": 0.40,
+            },
+            {
+                "WSVD_COMPONENT_CORR_THRESH": 0.20,
+                "WSVD_CHANNEL_R2_MIN": 0.22,
+                "PT_THRESHOLD_FACTOR": 0.45,
+            },
+        ]
+
+    return [
+        {
+            "WSVD_COMPONENT_CORR_THRESH": 0.25,
+            "WSVD_CHANNEL_R2_MIN": 0.30,
+            "PT_THRESHOLD_FACTOR": 0.80,
+        },
+        {
+            "WSVD_COMPONENT_CORR_THRESH": 0.30,
+            "WSVD_CHANNEL_R2_MIN": 0.35,
+            "PT_THRESHOLD_FACTOR": 1.00,
+        },
+        {
+            "WSVD_COMPONENT_CORR_THRESH": 0.35,
+            "WSVD_CHANNEL_R2_MIN": 0.40,
+            "PT_THRESHOLD_FACTOR": 1.20,
+        },
+    ]
+
+
+def write_tuned_config(config_values: dict, output_path):
+    """Write a YAML config file with the tuned values."""
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {}
+    for key, value in config_values.items():
+        payload[key.upper()] = value
+    out_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return out_path
+
+
+def run_hyperparameter_tuning(dataset_name: str, data_dir: str,
+                              max_recordings: int = None,
+                              output_path: str = None):
+    """Run a lightweight deterministic tuning pass over a few recordings."""
+    print("\n" + "=" * 70)
+    print(f"  Hyperparameter tuning — {dataset_name.upper()}")
+    print("=" * 70 + "\n")
+
+    handler = get_dataset(dataset_name)
+    recordings = handler.load_all_recordings(data_dir, max_recordings=max_recordings)
+    if not recordings:
+        print(f"[WARN] No recordings found for tuning in {data_dir}")
+        return None, None
+
+    candidates = build_tuning_candidates(dataset_name)
+    if output_path is None:
+        output_path = str(Path(__file__).parent / "configs" / f"{dataset_name}_tuned.yaml")
+
+    best_candidate = None
+    best_score = float("-inf")
+    for idx, candidate in enumerate(candidates, 1):
+        cfg = get_config(dataset_name)
+        for key, value in candidate.items():
+            setattr(cfg, key.upper(), value)
+
+        pipe = PHASEPipeline(
+            verbose=False,
+            dataset=dataset_name,
+            stdout_log_path=log_path,
+            config=cfg,
+        )
+
+        validation_scores = []
+        for rec in recordings[:3]:
+            try:
+                result = pipe.run(rec, save_figures=False, figures_dir="figures")
+                validation_scores.append(float(result.get("metrics", {}).get("F1", 0.0)))
+            except Exception as exc:
+                print(f"[WARN] tuning candidate {idx} failed on {rec['recording']}: {exc}")
+
+        mean_score = float(np.mean(validation_scores)) if validation_scores else float("-inf")
+        print(f"[TUNE] candidate {idx}: {candidate} -> mean F1={mean_score:.3f}")
+        if mean_score > best_score:
+            best_score = mean_score
+            best_candidate = candidate
+
+    if best_candidate is None:
+        best_candidate = candidates[0]
+
+    tuned_path = write_tuned_config(best_candidate, output_path)
+    print(f"[TUNE] Wrote tuned config to {tuned_path}")
+    return best_candidate, str(tuned_path)
+
 
 def run_full_dataset(dataset_name: str, data_dir: str,
                      save_figures: bool = True,
@@ -322,6 +435,14 @@ Examples:
         "--no_figures", action="store_true",
         help="Skip saving figures"
     )
+    parser.add_argument(
+        "--tune", action="store_true",
+        help="Run a lightweight hyperparameter tuning pass and write a tuned YAML config"
+    )
+    parser.add_argument(
+        "--tune_output", type=str, default=None,
+        help="Output path for the tuned YAML config"
+    )
 
     args = parser.parse_args()
 
@@ -346,6 +467,14 @@ Examples:
     print(f"[CONFIG] ICA_N_COMPONENTS        : {config.ICA_N_COMPONENTS}")
     print(f"[CONFIG] PATH_A_PREFERENCE       : {config.PATH_A_PREFERENCE}")
     print(f"[CONFIG] CONFIDENCE_GATE         : {config.CONFIDENCE_GATE_THRESHOLD}\n")
+
+    if args.tune:
+        run_hyperparameter_tuning(
+            args.dataset,
+            str(data_path),
+            max_recordings=args.max_recordings,
+            output_path=args.tune_output,
+        )
 
     if args.mode == "single":
         if args.recording:

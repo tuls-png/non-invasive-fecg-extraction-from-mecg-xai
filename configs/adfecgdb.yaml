@@ -7,13 +7,19 @@
 # - Shorter, controlled recordings
 # - .edf.qrs annotations available
 
-maternal_hr_min: 55
-maternal_hr_max: 110
-fetal_hr_min: 100
-fetal_hr_max: 185
-fetal_hr_low: 100
-fetal_hr_high: 185
-fetal_hr_centre: 130
-ekf_fetal_hr_init: 150
+MATERNAL_HR_MIN: 55
+MATERNAL_HR_MAX: 110
+FETAL_HR_MIN: 100
+FETAL_HR_MAX: 185
+FETAL_HR_LOW: 100
+FETAL_HR_HIGH: 185
+FETAL_HR_CENTRE: 130
+EKF_FETAL_HR_INIT: 150
+
+# New roadmap controls for robustness and ablation
+SQI_FUSION_ENABLED: true
+PERIODICITY_SCORE_ENABLED: true
+ADAPTIVE_FILTER_ENABLED: true
+EKF_USE_RTS_DEFAULT: true
 
 

@@ -29,190 +29,211 @@ to account for maternal ECG morphology changes due to:
 
 This is the methodological improvement over basic template subtraction
 that justifies its inclusion as a novel contribution.
+
+DISSERTATION MODIFICATION [Enhancement Roadmap, Rank 1]:
+  This module implements "Path C": a third, independent maternal-
+  cancellation + IC-extraction path fed into pipeline.py alongside the
+  existing Path A (ICA1-direct) and Path B (AW-WSVD residual -> ICA2).
+  Path C is amplitude/morphology-based rather than kurtosis- or subspace-
+  based, and is therefore expected to resolve exactly the "symmetric IC
+  selection failure" cases where ICA's maternal component overlaps in
+  frequency/kurtosis with the fetal component (see pipeline.py
+  `_find_maternal_residual_idx` / `_score_ic_unified` docstrings for the
+  existing kurtosis/subspace-based approach this complements).
+
+  Per-beat local amplitude scaling (`alpha` below, a least-squares scalar
+  fit of the template to each individual beat window) is what makes the
+  subtraction "adaptive" rather than a single fixed template: it absorbs
+  beat-to-beat amplitude modulation (e.g. respiratory) without needing a
+  full re-estimation of the template shape at every beat.
 """
 
 import numpy as np
-from scipy.signal import butter, filtfilt
-from configs import BaseConfig
-
-# Use BaseConfig defaults (shared across all datasets)
-_cfg = BaseConfig()
-FS = _cfg.FS
 
 
 def extract_maternal_template(abd_signals: np.ndarray,
                                maternal_peaks: np.ndarray,
-                               fs: int = FS,
-                               half_window_sec: float = 0.35) -> np.ndarray:
+                               fs: int,
+                               half_window_sec: float = 0.15) -> tuple:
     """
-    Extract average maternal beat template from multichannel abdominal signals.
-
-    For each channel, segments of length 2*half_window around each maternal
-    R-peak are extracted and ensemble-averaged. The average shape is the
-    template — it represents the pure maternal PQRST complex in that channel.
+    Extract a robust (median-synchronised) maternal PQRST template per
+    channel from the given set of maternal R-peak locations.
 
     Parameters
     ----------
-    abd_signals      : (n_channels, N) preprocessed abdominal signals
-    maternal_peaks   : (K,) R-peak indices
-    fs               : sampling rate
-    half_window_sec  : half-window around each peak in seconds (default 350ms)
-                       covers full PQRST complex at normal HR
+    abd_signals     : (n_ch, N) preprocessed abdominal signal
+    maternal_peaks  : (K,) sample indices of maternal QRS peaks used to
+                      build the template (a subset of all detected beats
+                      when called from adaptive_template_subtraction's
+                      local-context windows)
+    fs              : sampling rate
+    half_window_sec : half-window length in seconds around each R-peak
 
     Returns
     -------
-    template : (n_channels, window_len) average maternal beat template
+    template : (n_ch, 2*hw+1) robust per-channel maternal beat template.
+               All-zero if fewer than 3 valid (in-bounds) peaks are given.
+    hw       : half-window length in samples (so callers can reuse it
+               without recomputing int(half_window_sec * fs))
     """
-    n_channels = abd_signals.shape[0]
-    N          = abd_signals.shape[1]
-    hw         = int(half_window_sec * fs)
-    win_len    = 2 * hw
+    n_ch, N = abd_signals.shape
+    hw = max(1, int(half_window_sec * fs))
+    win_len = 2 * hw + 1
 
-    # Collect valid beats (those fully within signal bounds)
-    beats = []
-    for pk in maternal_peaks:
-        lo = pk - hw
-        hi = pk + hw
-        if lo >= 0 and hi <= N:
-            segment = abd_signals[:, lo:hi]   # (n_channels, win_len)
-            beats.append(segment)
+    valid_peaks = [int(p) for p in maternal_peaks
+                   if int(p) - hw >= 0 and int(p) + hw < N]
 
-    if len(beats) == 0:
-        return np.zeros((n_channels, win_len))
+    if len(valid_peaks) < 3:
+        return np.zeros((n_ch, win_len)), hw
 
-    # Ensemble average — aligns all beats at the R-peak and averages
-    # This suppresses the fetal ECG (random phase relative to maternal)
-    # and reinforces the maternal PQRST (fixed phase relative to peak)
-    template = np.mean(np.stack(beats, axis=0), axis=0)  # (n_channels, win_len)
+    windows = np.zeros((n_ch, len(valid_peaks), win_len))
+    for ch in range(n_ch):
+        for i, p in enumerate(valid_peaks):
+            windows[ch, i] = abd_signals[ch, p - hw:p + hw + 1]
 
-    return template
+    # Median across beats: robust to occasional outlier beats (ectopic
+    # beats, motion artifact, contraction-related electrode shift) that
+    # would otherwise distort a simple mean template.
+    template = np.median(windows, axis=1)
+    return template, hw
 
 
 def adaptive_template_subtraction(abd_signals: np.ndarray,
                                    maternal_peaks: np.ndarray,
-                                   fs: int = FS,
-                                   half_window_sec: float = 0.35,
-                                   update_every: int = 30) -> np.ndarray:
+                                   fs: int,
+                                   half_window_sec: float = 0.15,
+                                   update_every: int = 20,
+                                   context_beats: int = 15,
+                                   min_beats_for_template: int = 5) -> np.ndarray:
     """
-    Adaptive maternal ECG cancellation via template subtraction.
+    Subtract a locally-adaptive maternal PQRST template at every detected
+    maternal beat location.
 
-    Novel contribution: the template is re-estimated every `update_every`
-    beats using a sliding window of recent beats. This adapts to slow
-    morphology changes due to respiration and movement.
-
-    For each detected maternal peak:
-      1. Look up the current local template (re-estimated periodically)
-      2. Scale the template to match the local beat amplitude
-         (handles respiratory amplitude modulation)
-      3. Subtract the scaled template from the signal at that peak location
+    For every block of `update_every` consecutive beats, a fresh template
+    is estimated from a wider local context (`context_beats` beats on
+    each side of the block, so the template is stable but still tracks
+    slow morphology drift). Within the block, each individual beat window
+    is scaled by a least-squares-optimal scalar `alpha` before
+    subtraction, so that beat-to-beat amplitude modulation (breathing,
+    electrode movement) does not cause over- or under-subtraction.
 
     Parameters
     ----------
-    abd_signals    : (n_channels, N) preprocessed abdominal signals
-    maternal_peaks : (K,) R-peak indices
-    fs             : sampling rate
-    half_window_sec: half-window for template extraction/subtraction
-    update_every   : re-estimate template every N beats (default 30 ≈ 20–30s)
+    abd_signals             : (n_ch, N) preprocessed abdominal signal
+    maternal_peaks          : (K,) sample indices of ALL detected maternal
+                               QRS peaks for this recording
+    fs                      : sampling rate
+    half_window_sec         : +/- window (seconds) around each R-peak
+                               subtracted at every beat
+    update_every            : number of beats between template re-estimates
+    context_beats           : beats on each side of the current block used
+                               to build that block's local template
+    min_beats_for_template  : minimum number of usable maternal beats
+                               required to attempt subtraction at all
 
     Returns
     -------
-    residual : (n_channels, N) signal with maternal ECG removed
+    residual : (n_ch, N) abd_signals with the locally-adaptive maternal
+               template subtracted at every beat location. If there are
+               too few usable beats, returns abd_signals unchanged
+               (re-centred), matching the "safer to leave unchanged than
+               over-subtract" convention used elsewhere in this codebase
+               (see separation/wsvd.py's per-window correlation gate).
     """
-    n_channels, N = abd_signals.shape
-    hw            = int(half_window_sec * fs)
-    residual      = abd_signals.copy()
+    n_ch, N = abd_signals.shape
+    residual = abd_signals.copy()
 
-    K = len(maternal_peaks)
-    if K == 0:
+    hw = max(1, int(half_window_sec * fs))
+    peaks = np.asarray(sorted(int(p) for p in maternal_peaks
+                               if hw <= int(p) < N - hw))
+
+    if len(peaks) < min_beats_for_template:
+        print(f"[TEMPLATE-SUB] Only {len(peaks)} usable maternal beats "
+              f"(< {min_beats_for_template}) -- skipping Path C subtraction")
+        residual = residual - residual.mean(axis=1, keepdims=True)
         return residual
 
-    # Initial global template from all beats
-    template = extract_maternal_template(abd_signals, maternal_peaks, fs,
-                                          half_window_sec)
+    n_beats = len(peaks)
+    win_len = 2 * hw + 1
+    templates_used = 0
+    alphas_all = []
 
-    for i, pk in enumerate(maternal_peaks):
-        lo = pk - hw
-        hi = pk + hw
+    for start_i in range(0, n_beats, max(1, update_every)):
+        end_i = min(start_i + update_every, n_beats)
 
-        # Skip beats too close to signal boundaries
-        if lo < 0 or hi > N:
-            continue
+        ctx_lo = max(0, start_i - context_beats)
+        ctx_hi = min(n_beats, end_i + context_beats)
+        ctx_peaks = peaks[ctx_lo:ctx_hi]
 
-        # Re-estimate template every `update_every` beats
-        # Use beats in a ±update_every/2 window around current beat
-        if i % update_every == 0 and i > 0:
-            window_start = max(0, i - update_every // 2)
-            window_end   = min(K, i + update_every // 2)
-            local_peaks  = maternal_peaks[window_start:window_end]
-            template     = extract_maternal_template(
-                abd_signals, local_peaks, fs, half_window_sec
-            )
+        template, _ = extract_maternal_template(
+            abd_signals, ctx_peaks, fs, half_window_sec)
+        templates_used += 1
 
-        # Local amplitude scaling per channel
-        # Matches the template amplitude to the current beat amplitude
-        # This corrects for respiratory modulation of maternal ECG amplitude
-        current_beat   = abd_signals[:, lo:hi]          # (n_channels, win_len)
-        template_power = np.sum(template**2, axis=1)    # (n_channels,)
-        signal_power   = np.sum(current_beat * template,
-                                axis=1)                 # cross-correlation
+        for i in range(start_i, end_i):
+            p = peaks[i]
+            for ch in range(n_ch):
+                seg = abd_signals[ch, p - hw:p + hw + 1]
+                t = template[ch]
+                denom = float(np.dot(t, t)) + 1e-10
+                if denom < 1e-9:
+                    continue
+                # Least-squares-optimal scalar amplitude fit of the
+                # template to this individual beat window.
+                alpha = float(np.dot(seg, t)) / denom
+                # Sanity bound: never invert polarity or blow up on a
+                # spurious/near-zero-energy template match.
+                alpha = float(np.clip(alpha, 0.0, 2.0))
+                residual[ch, p - hw:p + hw + 1] = seg - alpha * t
+                alphas_all.append(alpha)
 
-        # Scale factor: how much to scale template to match current beat
-        scale = signal_power / (template_power + 1e-10)  # (n_channels,)
-        scale = np.clip(scale, 0.3, 3.0)                 # prevent extreme scaling
+    residual = residual - residual.mean(axis=1, keepdims=True)
 
-        # Subtract scaled template
-        scaled_template       = template * scale[:, np.newaxis]
-        residual[:, lo:hi]   -= scaled_template
-
-    # Re-centre residual (subtraction may introduce small DC drift)
-    residual -= residual.mean(axis=1, keepdims=True)
+    mean_alpha = float(np.mean(alphas_all)) if alphas_all else 0.0
+    print(f"[TEMPLATE-SUB] Adaptive template subtraction: {n_beats} beats, "
+          f"{templates_used} template updates (every {update_every} beats, "
+          f"context={context_beats} beats), mean beat-scale alpha={mean_alpha:.3f}")
 
     return residual
 
 
-def verify_cancellation(abd_signals: np.ndarray,
-                         residual: np.ndarray,
-                         maternal_peaks: np.ndarray,
-                         fs: int = FS,
+def verify_cancellation(abd_signals: np.ndarray, residual: np.ndarray,
+                         maternal_peaks: np.ndarray, fs: int,
                          half_window_sec: float = 0.15) -> dict:
     """
-    Measure how much maternal energy remains after cancellation.
-
-    Computes the ratio of residual power at maternal peak locations
-    to original signal power at those locations. Lower = better cancellation.
+    Diagnostic check: how much energy was removed at maternal beat
+    locations by the template subtraction, comparing `abd_signals`
+    (pre-subtraction) to `residual` (post-subtraction).
 
     Returns
     -------
-    dict with per-channel and mean cancellation ratio (dB)
+    dict with:
+        energy_reduction_pct : percent energy reduction at beat windows
+        n_beats_checked      : number of in-bounds beats used
+        pre_beat_energy      : summed squared amplitude pre-subtraction
+        post_beat_energy     : summed squared amplitude post-subtraction
     """
-    hw      = int(half_window_sec * fs)
-    N       = abd_signals.shape[1]
-    ratios  = []
+    hw = max(1, int(half_window_sec * fs))
+    n_ch, N = abd_signals.shape
+    peaks = [int(p) for p in maternal_peaks if hw <= int(p) < N - hw]
 
-    for pk in maternal_peaks:
-        lo = pk - hw
-        hi = pk + hw
-        if lo < 0 or hi > N:
-            continue
-        orig_power = np.mean(abd_signals[:, lo:hi]**2, axis=1)
-        res_power  = np.mean(residual[:, lo:hi]**2, axis=1)
-        ratio      = res_power / (orig_power + 1e-12)
-        ratios.append(ratio)
+    if len(peaks) == 0:
+        return {
+            "energy_reduction_pct": 0.0,
+            "n_beats_checked": 0,
+            "pre_beat_energy": 0.0,
+            "post_beat_energy": 0.0,
+        }
 
-    if not ratios:
-        return {"mean_cancellation_db": 0.0}
+    pre_energy = 0.0
+    post_energy = 0.0
+    for p in peaks:
+        pre_energy += float(np.sum(abd_signals[:, p - hw:p + hw + 1] ** 2))
+        post_energy += float(np.sum(residual[:, p - hw:p + hw + 1] ** 2))
 
-    ratios = np.array(ratios)           # (K, n_channels)
-    mean_ratio = np.mean(ratios)
-    cancellation_db = -10 * np.log10(mean_ratio + 1e-12)
-
-    print(f"[Template] Maternal cancellation: {cancellation_db:.1f} dB "
-          f"(power reduction at QRS locations)")
-
+    reduction = 1.0 - post_energy / (pre_energy + 1e-12)
     return {
-        "mean_ratio"          : float(mean_ratio),
-        "cancellation_db"     : float(cancellation_db),
-        "per_channel_db"      : (-10 * np.log10(
-                                    np.mean(ratios, axis=0) + 1e-12
-                                 )).tolist(),
+        "energy_reduction_pct": float(reduction * 100.0),
+        "n_beats_checked": len(peaks),
+        "pre_beat_energy": float(pre_energy),
+        "post_beat_energy": float(post_energy),
     }

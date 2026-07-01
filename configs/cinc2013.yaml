@@ -18,16 +18,22 @@ fetal_hr_centre: 130
 ekf_fetal_hr_init: 140
 
 # Lower WSVD thresholds to trigger cancellation on high-maternal-SNR recordings
-wsvd_component_corr_thresh: 0.15
-wsvd_channel_r2_min: 0.20
+WSVD_COMPONENT_CORR_THRESH: 0.15
+WSVD_CHANNEL_R2_MIN: 0.20
 
 # Match ADFECGDB bandpass to avoid baseline drift
-bandpass_low: 5.0
+BANDPASS_LOW: 5.0
 
 # Lower PT_THRESHOLD_FACTOR to recover weak fetal beats post-subtraction
-pt_threshold_factor: 0.35
+PT_THRESHOLD_FACTOR: 0.35
 
 # Path selection & confidence
-path_a_preference: 1.0
-confidence_gate_threshold: 0.30
-hr_sep_min_bpm: 15
+PATH_A_PREFERENCE: 1.0
+CONFIDENCE_GATE_THRESHOLD: 0.30
+HR_SEP_MIN_BPM: 15
+
+# New roadmap controls for robustness and ablation
+SQI_FUSION_ENABLED: true
+PERIODICITY_SCORE_ENABLED: true
+ADAPTIVE_FILTER_ENABLED: true
+EKF_USE_RTS_DEFAULT: true

@@ -8,6 +8,15 @@ Dataset-specific overrides are applied via YAML configuration files.
 All parameters are stored as class attributes and can be accessed as:
     config = BaseConfig()
     value = config.PARAMETER_NAME
+
+DISSERTATION MODIFICATION [Literature Review / Enhancement Roadmap]:
+  All new hyperparameters introduced by Rank 1-6 of the enhancement
+  roadmap are added below as class-level defaults, each individually
+  overridable via the per-dataset YAML files (configs/<dataset>.yaml)
+  using the same lower-case-key -> UPPER_CASE-attribute convention as
+  every existing parameter. Every new feature is also individually
+  switchable via an *_ENABLED boolean so it can be turned off for
+  ablation studies without touching pipeline.py.
 """
 
 import numpy as np
@@ -86,6 +95,12 @@ class BaseConfig:
         [0.30, 0.20, np.pi / 2],        # T wave
     ])
 
+    # [Rank 5] EKF forward-backward (RTS) smoothing default. Exposed here so
+    # it is a dataset-tunable/ablatable hyperparameter instead of only a
+    # PHASEPipeline constructor argument. PHASEPipeline(use_rts=None) will
+    # fall back to this value; explicit True/False still overrides it.
+    EKF_USE_RTS_DEFAULT = True
+
     # -- Path B ICA2 maternal residual exclusion --------------------------------
     MATERNAL_ICA2_CORR_THRESH = 0.30
 
@@ -118,6 +133,52 @@ class BaseConfig:
     # -- Confidence gate ------------------------------------------------------
     # chosen_ic_selection_score < threshold → low_confidence=True in metadata.
     CONFIDENCE_GATE_THRESHOLD = 0.05
+
+    # =====================================================================
+    # [Rank 1] Path C — Adaptive beat-template subtraction (new IC path)
+    # =====================================================================
+    # Estimates a maternal PQRST template per recording and subtracts it
+    # directly at each maternal beat location (morphology-based cancellation,
+    # complementary to the AW-WSVD subspace-based cancellation in Path B).
+    PATH_C_ENABLED = True
+    TEMPLATE_HALF_WINDOW_SEC = 0.15      # +/- window around each maternal R-peak
+    TEMPLATE_UPDATE_EVERY_BEATS = 20     # re-estimate template every N beats
+    TEMPLATE_CONTEXT_BEATS = 15          # beats on each side used to build a local template
+    TEMPLATE_MIN_BEATS = 5               # minimum maternal beats required to run Path C
+
+    # =====================================================================
+    # [Rank 2] SQI-weighted fusion across Path A / B / C
+    # =====================================================================
+    # Promotes evaluation/sqi.py from a diagnostic role to a first-class
+    # trust-weighting input in path selection (pipeline.py Step 9) and in
+    # IC candidate scoring inside _best_ic_ensemble().
+    SQI_FUSION_ENABLED = True
+    SQI_FUSION_WEIGHT = 0.35             # blend weight of SQI vs raw unified score, in [0, 1]
+    SQI_KURTOSIS_NORM = 20.0             # normalisation constant for the kurtosis sub-score
+    SQI_MIN_QUALITY_THRESH = 0.15        # used by evaluation.sqi.select_best_channels()
+
+    # =====================================================================
+    # [Rank 3] Periodicity-constrained IC scoring
+    # =====================================================================
+    # Adds an autocorrelation-peak-sharpness bonus term to score_fetal_ic()
+    # / score_maternal_ic() in separation/ica.py, following Sameni's
+    # periodic-component-analysis lineage and Kotas et al. (2024).
+    PERIODICITY_SCORE_ENABLED = True
+    PERIODICITY_SCORE_WEIGHT = 1.0       # scales the periodicity bonus contribution
+
+    # =====================================================================
+    # [Rank 4] Adaptive filter (RLS/NLMS) residual cleanup
+    # =====================================================================
+    # Runs after subtract_maternal() and before ICA2, using the AW-WSVD
+    # maternal reconstruction as the adaptive-filter reference signal, to
+    # mop up residual periodic maternal leakage before Path B's ICA stage.
+    ADAPTIVE_FILTER_ENABLED = True
+    ADAPTIVE_FILTER_METHOD = "rls"       # "rls" or "nlms"
+    ADAPTIVE_FILTER_N_TAPS = 5
+    ADAPTIVE_FILTER_FORGETTING = 0.995   # RLS forgetting factor (lambda)
+    ADAPTIVE_FILTER_DELTA = 1.0          # RLS inverse-correlation init constant
+    ADAPTIVE_FILTER_STEP_SIZE = 0.02     # NLMS step size (mu)
+    ADAPTIVE_FILTER_EPS = 1e-6           # NLMS division-by-zero guard
 
     def __init__(self, dataset: str = "adfecgdb"):
         """
