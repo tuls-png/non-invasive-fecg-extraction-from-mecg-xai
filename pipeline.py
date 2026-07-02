@@ -797,18 +797,27 @@ class PHASEPipeline:
                   f"HR={a_hr:.1f} BPM, valid={'YES' if a_valid else 'NO'}, "
                   f"stability={a_stability:.3f}, score={a_score:.4f}")
 
-        # Step 4.5: Path C -- adaptive template subtraction + ICA3  [NEW - Rank 1]
+        # Step 4.5: Path C -- Adaptive Windowed Weighted SVD, epoch domain
+        # (beat-template subtraction) + ICA3  [NEW - Rank 1]
+        # Runs on abd_proc directly (NOT on Path B's residual): Path A/B/C
+        # are independent, parallel candidate-generation paths, unified
+        # only at Step 9/9b scoring. See separation/template_subtraction.py
+        # module docstring for the two-axis AW-WSVD framing.
         c_sig = c_idx = c_peaks = c_hr = c_stability = c_score = None
         c_valid = False
         ts_metrics = None
         if getattr(cfg, "PATH_C_ENABLED", False):
-            self._log("Step 4.5: Path C -- adaptive template subtraction + ICA3...")
+            _tmpl_estimator = getattr(cfg, "TEMPLATE_ESTIMATOR", "median")
+            self._log(f"Step 4.5: Path C -- AW-WSVD (epoch domain, "
+                      f"estimator={_tmpl_estimator}) + ICA3...")
             residual_c = adaptive_template_subtraction(
                 abd_proc, maternal_peaks, fs,
                 half_window_sec=cfg.TEMPLATE_HALF_WINDOW_SEC,
                 update_every=cfg.TEMPLATE_UPDATE_EVERY_BEATS,
                 context_beats=cfg.TEMPLATE_CONTEXT_BEATS,
                 min_beats_for_template=cfg.TEMPLATE_MIN_BEATS,
+                estimator=_tmpl_estimator,
+                svd_n_components=getattr(cfg, "TEMPLATE_SVD_N_COMPONENTS", 1),
             )
             ts_metrics = verify_cancellation(
                 abd_proc, residual_c, maternal_peaks, fs,
@@ -1355,15 +1364,17 @@ class PHASEPipeline:
         # Rank 6, per-dataset threshold tuning, is a run_experiment_new.py
         # / offline concern and does not change separation-stage code.)
 
-        # Config 6: + Path C (template subtraction third path)
-        self._log("  Config 6: + Path C (template subtraction)...")
+        # Config 6: + Path C (AW-WSVD, epoch domain / template subtraction)
+        self._log("  Config 6: + Path C (AW-WSVD, epoch domain)...")
         try:
             residual_c = adaptive_template_subtraction(
                 abd_proc, mat_peaks_blind, fs,
                 half_window_sec=cfg.TEMPLATE_HALF_WINDOW_SEC,
                 update_every=cfg.TEMPLATE_UPDATE_EVERY_BEATS,
                 context_beats=cfg.TEMPLATE_CONTEXT_BEATS,
-                min_beats_for_template=cfg.TEMPLATE_MIN_BEATS)
+                min_beats_for_template=cfg.TEMPLATE_MIN_BEATS,
+                estimator=getattr(cfg, "TEMPLATE_ESTIMATOR", "median"),
+                svd_n_components=getattr(cfg, "TEMPLATE_SVD_N_COMPONENTS", 1))
             ICs2_c, _ = run_ica(residual_c)
             excl_c    = _find_maternal_residual_idx(ICs2_c, mat_ic_blind, cfg_ablation)
             sig_c, pks_c = _select(ICs2_c, excl_c, mat_hr_blind, mat_ic_blind, mat_peaks_blind)

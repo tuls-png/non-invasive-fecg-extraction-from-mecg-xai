@@ -135,16 +135,32 @@ class BaseConfig:
     CONFIDENCE_GATE_THRESHOLD = 0.05
 
     # =====================================================================
-    # [Rank 1] Path C — Adaptive beat-template subtraction (new IC path)
+    # [Rank 1] Path C — Adaptive Windowed Weighted SVD, epoch domain
     # =====================================================================
-    # Estimates a maternal PQRST template per recording and subtracts it
-    # directly at each maternal beat location (morphology-based cancellation,
-    # complementary to the AW-WSVD subspace-based cancellation in Path B).
+    # Path B (separation/wsvd.py) performs adaptive windowed weighted SVD
+    # along the channel x time axis. Path C performs the same underlying
+    # operation -- adaptive, windowed, weighted low-rank decomposition for
+    # maternal-component estimation -- along the beat-epoch x within-beat-
+    # sample axis instead (see separation/template_subtraction.py module
+    # docstring for the full two-axis framing). Estimates a maternal PQRST
+    # template from a local window of aligned beats and subtracts it
+    # directly at each maternal beat location, at a least-squares-optimal
+    # per-beat amplitude scale.
     PATH_C_ENABLED = True
     TEMPLATE_HALF_WINDOW_SEC = 0.15      # +/- window around each maternal R-peak
     TEMPLATE_UPDATE_EVERY_BEATS = 20     # re-estimate template every N beats
     TEMPLATE_CONTEXT_BEATS = 15          # beats on each side used to build a local template
     TEMPLATE_MIN_BEATS = 5               # minimum maternal beats required to run Path C
+    # "median": robust (outlier-beat-resistant) estimate of the recurring
+    #   beat shape across the local beat-epoch matrix. Default.
+    # "svd": explicit weighted SVD of the beat-epoch matrix (top
+    #   `TEMPLATE_SVD_N_COMPONENTS` singular modes), the direct epoch-
+    #   domain analogue of Path B's channel-time weighted SVD, and the
+    #   formulation matching Kanjilal, Palit & Saha (1997) TS_SVD.
+    # Compare both via scripts/compare_template_estimators.py before
+    # relying on either in the dissertation write-up.
+    TEMPLATE_ESTIMATOR = "median"
+    TEMPLATE_SVD_N_COMPONENTS = 1        # used only when TEMPLATE_ESTIMATOR="svd"
 
     # =====================================================================
     # [Rank 2] SQI-weighted fusion across Path A / B / C

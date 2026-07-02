@@ -1,0 +1,813 @@
+PHASE Debug Log — 2026-07-02T12:56:26.624831
+================================================================================
+
+============================================================
+Recording : a01
+============================================================
+  Maternal peaks : 80
+  Maternal HR    : 80.5 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 0
+  Peaks          : 145
+  HR (mean)      : 148.0 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.61549
+  Spectral score : N/A
+  Stability      : 0.400
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 142
+  HR (mean)      : 146.0 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.60740
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : A_ICA1_direct_IC1_148bpm
+  Combined A     : 0.61549
+  Combined B     : 0.60740
+  Chosen score   : 0.61549
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 145
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 145
+  Reference peaks: 145
+  Final HR       : 148.0 BPM
+  F1             : 96.55
+  Se             : 96.55
+  PPV            : 96.55
+  FHR MAE        : 8.04 BPM
+
+============================================================
+Recording : a02
+============================================================
+  Maternal peaks : 81
+  Maternal HR    : 88.4 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 2
+  Peaks          : 126
+  HR (mean)      : 127.5 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.49518
+  Spectral score : N/A
+  Stability      : 0.500
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 126
+  HR (mean)      : 127.5 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.48106
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : A_ICA1_direct_IC3_127bpm
+  Combined A     : 0.49518
+  Combined B     : 0.48106
+  Chosen score   : 0.49518
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 126
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 126
+  Reference peaks: 160
+  Final HR       : 127.5 BPM
+  F1             : 23.78
+  Se             : 21.25
+  PPV            : 26.98
+  FHR MAE        : 34.89 BPM
+
+============================================================
+Recording : a03
+============================================================
+  Maternal peaks : 101
+  Maternal HR    : 101.3 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 1
+  Peaks          : 127
+  HR (mean)      : 131.4 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.31902
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 102
+  HR (mean)      : 103.1 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : NO
+  Unified score  : 0.02266
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC2_129bpm
+  Combined A     : 0.31902
+  Combined B     : 0.02266
+  Chosen score   : 0.70412
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 128
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 128
+  Reference peaks: 128
+  Final HR       : 128.6 BPM
+  F1             : 98.44
+  Se             : 98.44
+  PPV            : 98.44
+  FHR MAE        : 3.27 BPM
+
+============================================================
+Recording : a04
+============================================================
+  Maternal peaks : 80
+  Maternal HR    : 80.0 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 1
+  Peaks          : 130
+  HR (mean)      : 131.1 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 1.07167
+  Spectral score : N/A
+  Stability      : 0.400
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 0
+  Peaks          : 129
+  HR (mean)      : 132.5 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.69556
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC3_130bpm
+  Combined A     : 1.07167
+  Combined B     : 0.69556
+  Chosen score   : 1.47920
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 129
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 129
+  Reference peaks: 129
+  Final HR       : 130.0 BPM
+  F1             : 100.00
+  Se             : 100.00
+  PPV            : 100.00
+  FHR MAE        : 1.57 BPM
+
+============================================================
+Recording : a05
+============================================================
+  Maternal peaks : 84
+  Maternal HR    : 83.6 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 2
+  Peaks          : 128
+  HR (mean)      : 128.7 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.87747
+  Spectral score : N/A
+  Stability      : 0.400
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 1
+  Peaks          : 128
+  HR (mean)      : 129.4 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.73565
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC3_129bpm
+  Combined A     : 0.87747
+  Combined B     : 0.73565
+  Chosen score   : 1.71632
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 129
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 129
+  Reference peaks: 129
+  Final HR       : 128.7 BPM
+  F1             : 99.22
+  Se             : 99.22
+  PPV            : 99.22
+  FHR MAE        : 2.26 BPM
+
+============================================================
+Recording : a06
+============================================================
+  Maternal peaks : 100
+  Maternal HR    : 100.5 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 0
+  Peaks          : 131
+  HR (mean)      : 142.0 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.43218
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 100
+  HR (mean)      : 100.5 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : NO
+  Unified score  : 0.00000
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : A_ICA1_direct_IC1_142bpm
+  Combined A     : 0.43218
+  Combined B     : 0.00000
+  Chosen score   : 0.43218
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 132
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 132
+  Reference peaks: 160
+  Final HR       : 142.8 BPM
+  F1             : 61.64
+  Se             : 56.25
+  PPV            : 68.18
+  FHR MAE        : 29.69 BPM
+
+============================================================
+Recording : a07
+============================================================
+  Maternal peaks : 90
+  Maternal HR    : 90.5 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 2
+  Peaks          : 114
+  HR (mean)      : 134.5 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.21094
+  Spectral score : N/A
+  Stability      : 0.602
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 100
+  HR (mean)      : 109.2 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.06354
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_spectral_IC4_128bpm
+  Combined A     : 0.21094
+  Combined B     : 0.06354
+  Chosen score   : 0.24168
+  Low confidence : YES
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 118
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 118
+  Reference peaks: 130
+  Final HR       : 128.2 BPM
+  F1             : 55.65
+  Se             : 53.08
+  PPV            : 58.47
+  FHR MAE        : 25.65 BPM
+
+============================================================
+Recording : a08
+============================================================
+  Maternal peaks : 74
+  Maternal HR    : 74.7 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 1
+  Peaks          : 128
+  HR (mean)      : 127.9 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 1.10813
+  Spectral score : N/A
+  Stability      : 0.400
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 128
+  HR (mean)      : 127.9 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.92994
+  Spectral score : N/A
+  Stability      : 0.600
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC3_128bpm
+  Combined A     : 1.10813
+  Combined B     : 0.92994
+  Chosen score   : 2.45825
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 128
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 128
+  Reference peaks: 128
+  Final HR       : 127.5 BPM
+  F1             : 99.22
+  Se             : 99.22
+  PPV            : 99.22
+  FHR MAE        : 1.55 BPM
+
+============================================================
+Recording : a09
+============================================================
+  Maternal peaks : 85
+  Maternal HR    : 88.1 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 0
+  Peaks          : 103
+  HR (mean)      : 125.4 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.19269
+  Spectral score : N/A
+  Stability      : 0.601
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 0
+  Peaks          : 20
+  HR (mean)      : 72.0 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : NO
+  Unified score  : 0.00000
+  Spectral score : N/A
+  Stability      : 0.200
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_spectral_IC1_131bpm
+  Combined A     : 0.19269
+  Combined B     : 0.00000
+  Chosen score   : 0.21653
+  Low confidence : YES
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 120
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 120
+  Reference peaks: 130
+  Final HR       : 132.2 BPM
+  F1             : 51.20
+  Se             : 49.23
+  PPV            : 53.33
+  FHR MAE        : 24.45 BPM
+
+============================================================
+Recording : a10
+============================================================
+  Maternal peaks : 100
+  Maternal HR    : 104.0 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 2
+  Peaks          : 148
+  HR (mean)      : 157.2 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.41530
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 110
+  HR (mean)      : 110.5 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : NO
+  Unified score  : 0.21005
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : A_ICA1_direct_IC3_157bpm
+  Combined A     : 0.41530
+  Combined B     : 0.21005
+  Chosen score   : 0.41530
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 150
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 150
+  Reference peaks: 175
+  Final HR       : 159.0 BPM
+  F1             : 75.69
+  Se             : 70.29
+  PPV            : 82.00
+  FHR MAE        : 23.14 BPM
+
+============================================================
+Recording : a11
+============================================================
+  Maternal peaks : 94
+  Maternal HR    : 95.1 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 2
+  Peaks          : 103
+  HR (mean)      : 130.3 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.16902
+  Spectral score : N/A
+  Stability      : 0.602
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 0
+  Peaks          : 12
+  HR (mean)      : 51.4 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : NO
+  Unified score  : 0.00000
+  Spectral score : N/A
+  Stability      : 0.200
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC3_135bpm
+  Combined A     : 0.16902
+  Combined B     : 0.00000
+  Chosen score   : 0.55541
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 127
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 127
+  Reference peaks: 140
+  Final HR       : 135.0 BPM
+  F1             : 64.42
+  Se             : 61.43
+  PPV            : 67.72
+  FHR MAE        : 20.34 BPM
+
+============================================================
+Recording : a12
+============================================================
+  Maternal peaks : 87
+  Maternal HR    : 87.5 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 0
+  Peaks          : 134
+  HR (mean)      : 136.9 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.56050
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 0
+  Peaks          : 18
+  HR (mean)      : 49.4 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : NO
+  Unified score  : 0.00000
+  Spectral score : N/A
+  Stability      : 0.200
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC1_138bpm
+  Combined A     : 0.56050
+  Combined B     : 0.00000
+  Chosen score   : 0.82597
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 138
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 138
+  Reference peaks: 138
+  Final HR       : 138.0 BPM
+  F1             : 99.28
+  Se             : 99.28
+  PPV            : 99.28
+  FHR MAE        : 3.64 BPM
+
+============================================================
+Recording : a13
+============================================================
+  Maternal peaks : 81
+  Maternal HR    : 82.1 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 0
+  Peaks          : 122
+  HR (mean)      : 132.9 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.36985
+  Spectral score : N/A
+  Stability      : 0.600
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 109
+  HR (mean)      : 123.2 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.12209
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC3_126bpm
+  Combined A     : 0.36985
+  Combined B     : 0.12209
+  Chosen score   : 1.22128
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 126
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 126
+  Reference peaks: 126
+  Final HR       : 126.0 BPM
+  F1             : 100.00
+  Se             : 100.00
+  PPV            : 100.00
+  FHR MAE        : 2.26 BPM
+
+============================================================
+Recording : a14
+============================================================
+  Maternal peaks : 100
+  Maternal HR    : 101.1 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 1
+  Peaks          : 114
+  HR (mean)      : 122.6 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.51322
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 2
+  Peaks          : 105
+  HR (mean)      : 107.4 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : NO
+  Unified score  : 0.03829
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC2_124bpm
+  Combined A     : 0.51322
+  Combined B     : 0.03829
+  Chosen score   : 0.91011
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 124
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 124
+  Reference peaks: 123
+  Final HR       : 123.8 BPM
+  F1             : 99.60
+  Se             : 100.00
+  PPV            : 99.19
+  FHR MAE        : 0.75 BPM
+
+============================================================
+Recording : a15
+============================================================
+  Maternal peaks : 74
+  Maternal HR    : 73.7 BPM
+
+  --- Path A (ICA1 direct) ---
+  IC index       : 0
+  Peaks          : 134
+  HR (mean)      : 134.9 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 1.04334
+  Spectral score : N/A
+  Stability      : 0.302
+  Spectral fb    : N/A
+
+  --- Path B (WSVD + ICA2) ---
+  IC index       : 1
+  Peaks          : 134
+  HR (mean)      : 135.7 BPM
+  HR (robust)    : N/A BPM
+  Valid HR gate  : YES
+  Unified score  : 0.95388
+  Spectral score : N/A
+  Stability      : 1.000
+  Spectral fb    : N/A
+
+  --- Path Selection ---
+  Chosen         : C_TemplateSub_ICA3_IC3_135bpm
+  Combined A     : 1.04334
+  Combined B     : 0.95388
+  Chosen score   : 1.48693
+  Low confidence : NO
+  Sparse annot.  : NO
+
+  --- EKF ---
+  Pre-EKF peaks  : None
+  Post-EKF peaks : 134
+  Peak ratio     : N/A (gate: >=0.70)
+  CC             : N/A (gate: >=0.60)
+  RR shift (ms)  : N/A (gate: <=15ms)
+  Gate passed    : N/A
+  EKF used       : YES
+
+  --- Final ---
+  Final peaks    : 134
+  Reference peaks: 134
+  Final HR       : 134.6 BPM
+  F1             : 100.00
+  Se             : 100.00
+  PPV            : 100.00
+  FHR MAE        : 1.72 BPM
+
