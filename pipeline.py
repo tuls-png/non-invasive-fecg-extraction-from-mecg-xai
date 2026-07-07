@@ -4,72 +4,34 @@ PHASE: Physiology-guided Hybrid Adaptive Signal Extraction
 
 Dual-path fetal IC selection:
   Path A -- ICA1 Direct: best non-maternal IC from ICA1
-  Path B -- WSVD + ICA2: best IC from ICA2 on WSVD residual
+  Path C -- Adaptive template subtraction + ICA3 [Rank 1]
 
-CHANGES FROM ORIGINAL:
-  [FIX-1] Path B ICA2: exclude ICA2 components correlated with maternal IC
-          (|corr| > MATERNAL_ICA2_CORR_THRESH). Previously exclude_idx=-1
-          meant no exclusion, allowing residual-maternal ICs to be selected.
-  [FIX-2] min_usable_peaks is now recording-length-adaptive (was hardcoded 100).
-  [FIX-3] ECHO has_reference passed explicitly; None passed for NIFECGDB so
-          morphology score is disabled rather than self-referential.
+Path A/C candidates are fused using an SQI-weighted trust score
+[Rank 2] on top of the unified three-factor IC-selection score,
+which includes a periodicity/autocorrelation bonus term
+[Rank 3] computed inside separation/ica.py.
 
-DISSERTATION MODIFICATIONS (unified, dataset-adaptive):
-  [MOD-1] _best_ic(): unified three-factor scoring replaces n_peaks x hr_score.
-          final_score = base_score x maternal_penalty x (1 + morphology_score)
-  [MOD-2] determine_n_components(): PCA-adaptive n_components before each ICA.
-          PCA floor raised 2->3: minimum 3 components for maternal/fetal/noise.
-  [MOD-3] ICA ensemble: N_ENSEMBLE=5 seeds. Stability-gated selection requires
-          winning IC to appear as top scorer in >= 2 seeds.
-  [MOD-4] adaptive_windowed_wsvd() receives duration_sec for adaptive windows.
+IMPLEMENTATION:
+  This module implements the core PHASE pipeline with Path B removed.
+  Available features:
+    Rank 1 - Path C: beat-template subtraction (separation/template_subtraction.py)
+    Rank 2 - SQI-weighted fusion across Path A/C (evaluation/sqi.py)
+    Rank 3 - Periodicity-constrained IC scoring (separation/ica.py)
+    Rank 5 - EKF forward-backward (RTS) smoothing (separation/ekf.py, already
+             implemented as FetalECGKalmanFilter.smooth(); now also exposed
+             as a dataset-tunable default via cfg.EKF_USE_RTS_DEFAULT)
+    Rank 6 - Hyperparameters for every feature are configurable via
+             configs/base.py defaults + per-dataset YAML overrides, and
+             every feature has an *_ENABLED flag so it can be toggled off
+             for ablation without touching this file.
 
-BIMODAL F1 FIX BATCH (targeting mean F1 > 85%):
-  [FIX-PATH-1] Score-based path selection: Step 9 now compares a_score vs
-          b_score x PATH_A_PREFERENCE instead of peak counts.
-
-  [FIX-PATH-2] Confidence gate: chosen_score < CONFIDENCE_GATE_THRESHOLD sets
-          low_confidence=True in metadata. Now triggers active retry with
-          different n_components when fired.
-
-  [FIX-PATH-3] Half-harmonic guard in _is_fetal_hr(): candidate rejected if
-          within HR_SEP_MIN_BPM of HALF the maternal HR.
-
-  [FIX-PATH-4] Annotation anomaly guard: n_reference < 50% expected minimum
-          sets sparse_annotation=True in metadata (catches a54).
-
-  [FIX-EKF]   EKF acceptance gate: peak count >= 70% AND CC >= 0.60 AND
-          |median_RR_post - median_RR_pre| <= 15ms. The CC and RR-shift
-          gates were documented but not implemented; now active.
-
-  [FIX-HARM]  Post-selection harmonic RR check: x1.0 and x2.0 only.
-
-  [FIX-RETRY] Under-detection retry: threshold changed from FETAL_HR_MIN-based
-          to FETAL_HR_CENTRE-based (65% of expected) so it fires on recordings
-          with 88-126 detected peaks that were previously missed.
-
-IMPROVEMENTS (v2):
-  [IMP-1] Raise CONFIDENCE_GATE_THRESHOLD in cinc2013.yaml to 0.30. When
-          low_confidence fires, retry with alternative n_components (n-1 and
-          n+1) and take the best result. Previously the gate was diagnostic-
-          only; now it drives active remediation.
-
-  [IMP-2] Cross-IC HR check after selection: if chosen IC HR is within
-          HR_SEP_MIN_BPM of maternal HR, force low_confidence=True and retry.
-          Fixes a02/a56 class failures where ICA1 misidentifies maternal IC
-          so the maternal component scores well in Path A and wins.
-
-  [IMP-3] Template-based morphology score: compute correlation of each beat
-          window against the mean-beat template (O(n)) instead of 20 random
-          pairs. More stable on weak fetal signals.
-
-  [IMP-4] Fix ensemble fallback seed: ENSEMBLE_SEEDS=[0,1,2,3,4] but fallback
-          tried seed=42 which is never in the pool. Changed to seed=0.
-
-  [IMP-5] WSVD corr gate: changed 'or med_corr >= 0.75*corr_thresh' to
-          'and' to prevent noise SVD components from passing on median alone.
-          (Change is in wsvd.py; documented here for traceability.)
+  Path C is optional: it can override Path A only if it produces a higher
+  (optionally SQI-fused) score. When PATH_C_ENABLED and SQI_FUSION_ENABLED
+  are False and PERIODICITY_SCORE_ENABLED is False, this file behaves as
+  a simplified Path A-only pipeline.
 """
 
+import copy
 import sys
 import numpy as np
 from pathlib import Path
@@ -78,7 +40,7 @@ from scipy.stats import kurtosis as scipy_kurtosis
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config_loader import get_config
-from preprocessing.filters import preprocess_multichannel, preprocess_channel
+from preprocessing.filters import preprocess_multichannel, preprocess_channel, bandpass_filter
 from preprocessing.qrs_detector import (
     detect_maternal_qrs, detect_fetal_qrs,
     detect_reference_fetal_qrs, compute_hr_stats, pan_tompkins,
@@ -93,9 +55,15 @@ from separation.wsvd import (
     subtract_maternal, svd_explained_variance
 )
 from separation.ekf import FetalECGKalmanFilter
+from separation.template_subtraction import (
+    adaptive_template_subtraction, verify_cancellation,
+)
+from separation.adaptive_filter import adaptive_residual_cleanup
 from evaluation.metrics import evaluate
+from evaluation.sqi import sqi_weighted_fusion, compute_candidate_sqi
 from xai.echo import ECHOExplainer
 from preprocessing.qrs_detector import load_wfdb_annotation
+from preprocessing.qrs_detector import dump_peak_positions
 
 # ── Ensemble hyperparameter ──────────────────────────────────────────────────
 N_ENSEMBLE = 5
@@ -106,7 +74,7 @@ MORPHOLOGY_MIN_PEAKS  = 5
 MORPHOLOGY_WIN_SEC    = 0.3
 STABILITY_LOG_THRESH  = 0.7
 
-# [FIX-PATH-2] default confidence gate — overridden by cinc2013.yaml
+
 _DEFAULT_CONFIDENCE_GATE = 0.05
 
 
@@ -136,7 +104,7 @@ def _is_fetal_hr(mean_hr: float, maternal_hr: float, cfg) -> bool:
     Check if a candidate HR is in the fetal range and sufficiently
     separated from maternal HR.
 
-    [FIX-PATH-3] Half-harmonic guard: candidate rejected if within
+   Half-harmonic guard: candidate rejected if within
     HR_SEP_MIN_BPM of HALF the maternal HR.
     """
     if np.isnan(mean_hr):
@@ -157,15 +125,125 @@ def _is_fetal_hr(mean_hr: float, maternal_hr: float, cfg) -> bool:
     return in_range and sep_from_maternal and sep_from_half
 
 
+def _estimate_fhr_unsupervised(abd_raw: np.ndarray, fs: int, maternal_hr: float,
+                               cfg, notch_bpm: float = 16.0):
+    """
+    [FIX-LEAKAGE] Unsupervised fetal-HR prior estimated from the abdominal
+    signal's own power spectrum. Replaces reading expected_fhr from the
+    ground-truth annotation file (the same file later used as ref_peaks for
+    evaluation) -- that was ground-truth leakage into IC/path selection.
+    Uses only abd_raw and maternal_hr -- no reference annotation.
+
+    [BUGFIX 2026-07] Two independent problems were found after auditing why
+    this prior locked onto ~197.75 BPM (the top edge of the search band) on
+    56/75 CinC2013 recordings:
+
+    1. This used to run on the fully preprocessed abd_proc, which for
+       CinC2013 has already been highpass-filtered at cfg.BANDPASS_LOW =
+       5.0 Hz. The search band here (FETAL_HR_MIN..MAX = 100..200 BPM =
+       1.67..3.33 Hz) sits entirely BELOW that cutoff -- inside the
+       filter's stopband/roll-off, not its passband. A highpass filter's
+       magnitude response rises monotonically toward the cutoff, so the
+       "PSD peak" was just the filter's roll-off curve, always landing on
+       the bin closest to 5 Hz (= 197.75 BPM), regardless of the actual
+       signal. This function now takes the RAW abdominal signal and
+       applies its OWN fixed, dataset-independent light highpass (0.5 Hz)
+       so the search band always sits safely inside the passband,
+       whatever cfg.BANDPASS_LOW the main pipeline uses for ICA/QRS work.
+
+    2. Picking argmax over the band accepts a monotonic ramp as a "peak"
+       even when the filtering is fine -- there's no requirement that the
+       winning bin actually be a local maximum. Now uses scipy.signal.
+       find_peaks on the notched band and only accepts genuine interior
+       peaks; a bin at the very edge of the search band with no interior
+       peak means "no reliable line found" (returns None), not a forced
+       answer.
+
+    Returns a (best_hr, confidence) tuple:
+      best_hr    : estimated fetal HR in BPM, or None if no genuine band
+                   peak survives the notch (caller falls back to the
+                   static clinical centre).
+      confidence : peakiness of the winning channel's band, computed as
+                   peak_power / robust_band_floor, where robust_band_floor
+                   is the median over ALL band bins (zeros included) plus
+                   a small floor -- not median-of-nonzero-only, which
+                   could collapse to near-zero after notching and blow the
+                   ratio up to absurd values (this was observed reaching
+                   ~29,000 in the old formula). Confidence is also capped
+                   at a sane ceiling for downstream use. 0.0 if best_hr is
+                   None.
+    """
+    from scipy.signal import welch, find_peaks
+
+    lo_hz = cfg.FETAL_HR_MIN / 60.0
+    hi_hz = cfg.FETAL_HR_MAX / 60.0
+
+    # Dedicated light highpass for THIS estimator only, independent of
+    # whatever BANDPASS_LOW the dataset config uses for the main pipeline.
+    # 0.5 Hz clears baseline wander while leaving the 1.67-3.33 Hz fetal-HR
+    # band fully inside the passband for every current dataset config.
+    PRIOR_HIGHPASS_HZ = 0.5
+
+    best_hr, best_power, best_confidence = None, -np.inf, 0.0
+    for ch in range(abd_raw.shape[0]):
+        prior_sig = bandpass_filter(abd_raw[ch], fs,
+                                     lowcut=PRIOR_HIGHPASS_HZ,
+                                     highcut=min(10.0, fs / 2 - 1),
+                                     order=2)
+
+        nperseg = min(8192, prior_sig.shape[0])
+        # Zero-pad for finer bin resolution -- the raw 8192-point Welch
+        # window only gives ~7.3 BPM/bin (14 bins across the whole fetal
+        # band), too coarse to tell a real line from a neighbouring bin.
+        nfft = max(nperseg, 1 << 16)
+        freqs, psd = welch(prior_sig, fs=fs, nperseg=nperseg, nfft=nfft)
+        band = (freqs >= lo_hz) & (freqs <= hi_hz)
+        if not np.any(band):
+            continue
+        band_freqs, band_psd = freqs[band], psd[band].copy()
+
+        for mult in (1.0, 2.0):
+            mat_hz = (maternal_hr * mult) / 60.0
+            notch  = np.abs(band_freqs - mat_hz) <= (notch_bpm / 60.0)
+            band_psd[notch] = 0.0
+
+        if band_psd.max() <= 0:
+            continue
+
+        # Robust floor uses the full band (zeros included) so notching
+        # can't artificially collapse the denominator.
+        floor = float(np.median(band_psd)) + 1e-12
+
+        peak_idx, _ = find_peaks(band_psd)
+        if peak_idx.size == 0:
+            # No interior local maximum survived -- the winning value
+            # would just be a band-edge artifact. Skip this channel.
+            continue
+
+        ch_best_i = peak_idx[np.argmax(band_psd[peak_idx])]
+        peak_power = band_psd[ch_best_i]
+        if peak_power > best_power:
+            best_power = peak_power
+            best_hr    = float(band_freqs[ch_best_i] * 60.0)
+            best_confidence = float(min(peak_power / floor, 50.0))
+
+    return best_hr, best_confidence
+
+
 def _hr_score(mean_hr, cfg, expected_hr=None):
-    centre = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
     if np.isnan(mean_hr):
         return 0.0
-    return 1.0 / (1.0 + abs(mean_hr - centre) / 30.0)
+    if expected_hr is not None:
+        centre    = expected_hr
+        bandwidth = 15.0
+    else:
+        centre    = cfg.FETAL_HR_CENTRE
+        bandwidth = 30.0
+    return 1.0 / (1.0 + abs(mean_hr - centre) / bandwidth)
 
 
 def _find_maternal_residual_idx(ICs, maternal_ic, cfg):
-    """[FIX-1] Find ICA2 component most correlated with maternal IC."""
+    """ Find ICA2 component most correlated with maternal IC."""
     best_idx  = -1
     best_corr = cfg.MATERNAL_ICA2_CORR_THRESH
     for i, ic in enumerate(ICs):
@@ -190,7 +268,7 @@ def _check_harmonic_confusion(chosen_peaks: np.ndarray,
                                fs: int,
                                tolerance: float = 0.10) -> bool:
     """
-    [FIX-HARM] Check whether chosen IC RR matches maternal harmonic at
+   Check whether chosen IC RR matches maternal harmonic at
     x1.0 or x2.0 only. x0.5 excluded — equals fetal RR when fetal ~2x maternal.
     """
     if len(chosen_peaks) < 3 or np.isnan(maternal_hr) or maternal_hr <= 0:
@@ -202,7 +280,7 @@ def _check_harmonic_confusion(chosen_peaks: np.ndarray,
     for harmonic_rr in [maternal_rr, maternal_rr * 2.0]:
         if harmonic_rr > 0:
             if abs(chosen_rr - harmonic_rr) / harmonic_rr < tolerance:
-                print(f"[FIX-HARM] Harmonic confusion suspected: "
+                print(f"Harmonic confusion suspected: "
                       f"chosen RR={chosen_rr*1000:.0f}ms, "
                       f"harmonic RR={harmonic_rr*1000:.0f}ms "
                       f"(maternal HR={maternal_hr:.1f}bpm, "
@@ -211,14 +289,13 @@ def _check_harmonic_confusion(chosen_peaks: np.ndarray,
     return False
 
 
-# ── [MOD-2] PCA-adaptive n_components ────────────────────────────────────────
 
 def determine_n_components(signals: np.ndarray,
                             variance_threshold: float = PCA_VARIANCE_THRESHOLD,
                             n_min: int = PCA_N_MIN,
                             n_max: int = PCA_N_MAX,
                             label: str = "") -> int:
-    """[MOD-2] Count PCA components explaining >= variance_threshold, clip to [n_min, n_max]."""
+    """Count PCA components explaining >= variance_threshold, clip to [n_min, n_max]."""
     try:
         _, S, _ = np.linalg.svd(signals, full_matrices=False)
         var_ratio = (S ** 2) / (np.sum(S ** 2) + 1e-12)
@@ -233,12 +310,11 @@ def determine_n_components(signals: np.ndarray,
     return n_comp
 
 
-# ── [MOD-1] Unified three-factor IC scoring ───────────────────────────────────
 
 def _morphology_score(sig: np.ndarray, peaks: np.ndarray,
                       fs: int, win_sec: float = MORPHOLOGY_WIN_SEC) -> float:
     """
-    [IMP-3] Template-based morphology score.
+    
 
     Compute correlation of each beat window against the mean-beat template
     (O(n)) instead of 20 random pairs. More stable on weak fetal signals
@@ -261,7 +337,7 @@ def _morphology_score(sig: np.ndarray, peaks: np.ndarray,
     if len(windows) < 2:
         return 0.0
 
-    # [IMP-3] template-based: correlate each beat against the mean template
+   
     min_len  = min(len(w) for w in windows)
     arr      = np.array([w[:min_len] for w in windows])
     template = np.mean(arr, axis=0)
@@ -278,13 +354,98 @@ def _morphology_score(sig: np.ndarray, peaks: np.ndarray,
     return float(np.mean(corrs)) if corrs else 0.0
 
 
+def _qrs_narrowness_score(sig: np.ndarray, peaks: np.ndarray, fs: int,
+                          narrow_ms: float = 30.0,
+                          wide_ms: float = 150.0) -> float:
+    """
+    [Rank 7, NEW] Energy-concentration ("QRS narrowness") score in [0, 1].
+
+    For each detected beat, compares the signal energy in a narrow QRS-width
+    window around the peak against the energy in a wider PQRST window around
+    the same peak. A genuine QRS complex is a sharp, narrow spike, so most of
+    the beat's energy sits inside the narrow window -> ratio close to 1.
+
+    A smooth quasi-periodic artifact (breathing modulation, an aliased
+    maternal harmonic, motion) can still pass the existing kurtosis and
+    autocorrelation-periodicity bonuses if it happens to have a peak in the
+    right rate range and repeats regularly -- but it spreads its energy
+    across the whole beat window rather than concentrating it near the
+    peak, so its narrowness ratio stays low. This gives the unified score a
+    single-beat *shape* signal that whole-signal statistics (kurtosis,
+    autocorrelation) do not capture, and is the main fix for "confidently
+    wrong" candidates: periodic, peaky-looking overall, but not actually
+    QRS-shaped beat by beat.
+
+    Returns 0.0 if there are too few peaks to form a reliable estimate.
+    """
+    if len(peaks) < MORPHOLOGY_MIN_PEAKS:
+        return 0.0
+    narrow_hw = max(1, int(round(narrow_ms / 1000.0 * fs)))
+    wide_hw   = max(narrow_hw + 1, int(round(wide_ms / 1000.0 * fs)))
+    N = len(sig)
+
+    ratios = []
+    for p in peaks:
+        lo_w, hi_w = int(p) - wide_hw, int(p) + wide_hw
+        if lo_w < 0 or hi_w > N:
+            continue
+        wide_energy = float(np.sum(sig[lo_w:hi_w] ** 2)) + 1e-12
+
+        lo_n, hi_n = int(p) - narrow_hw, int(p) + narrow_hw
+        narrow_energy = float(np.sum(sig[lo_n:hi_n] ** 2))
+
+        ratios.append(narrow_energy / wide_energy)
+
+    if not ratios:
+        return 0.0
+    return float(np.clip(np.mean(ratios), 0.0, 1.0))
+
+
+def _rr_smoothness_score(peaks: np.ndarray, fs: int,
+                         min_peaks_for_cv: int = 5) -> float:
+    """
+    [NEW] RR-interval smoothness score in (0, 1], used as a fourth
+    arbitration factor alongside QRS-narrowness and the spectral-prior gap
+    (see run(), Step 9c).
+
+    Precedent: Behar et al. 2014 ("Combining and Benchmarking Methods of
+    Foetal ECG Extraction Without Maternal or Scalp Electrode Data",
+    Physiol. Meas. 35(8):1569-89) ran template subtraction and ICA in
+    several orderings and selected, per recording, whichever result gave
+    the smoothest heart-rate variability -- not a spectral or shape
+    criterion. This function adapts that selection axis into this
+    pipeline's existing multi-factor arbitration instead of using it
+    alone: a genuine fetal beat sequence has physiologically smooth
+    beat-to-beat timing, while a candidate locked onto a periodic artifact
+    (aliased maternal harmonic, breathing modulation, motion) that happens
+    to pass the narrowness and prior-gap checks often still shows more
+    erratic RR-interval timing.
+
+    Returns coefficient-of-variation-based smoothness = 1 / (1 + CV), so a
+    perfectly regular beat sequence (CV -> 0) approaches 1.0 and an erratic
+    one decays toward 0. Returns 0.0 if there are too few peaks to compute
+    a reliable CV (matches _qrs_narrowness_score's fail-safe convention).
+    """
+    if len(peaks) < min_peaks_for_cv:
+        return 0.0
+    rr = np.diff(np.sort(peaks)) / float(fs)
+    rr = rr[rr > 0]
+    if len(rr) < min_peaks_for_cv - 1:
+        return 0.0
+    mean_rr = float(np.mean(rr))
+    if mean_rr <= 1e-9:
+        return 0.0
+    cv = float(np.std(rr) / mean_rr)
+    return float(1.0 / (1.0 + cv))
+
+
 def _maternal_penalty(ic: np.ndarray,
                       maternal_ic: np.ndarray,
                       maternal_hr: float,
                       fs: int,
                       path_b_half_weight: bool = False) -> float:
     """
-    [MOD-1] Maternal leakage penalty factor.
+   Maternal leakage penalty factor.
     penalty = 1 - max(|corr(IC, maternal_IC)|, |corr(IC, synthetic_maternal_harmonic)|)
     Path B flag halves the penalty weight.
     """
@@ -319,19 +480,36 @@ def _score_ic_unified(ic: np.ndarray,
                       maternal_ic: np.ndarray,
                       maternal_hr: float,
                       fs: int,
-                      path_b: bool = False) -> float:
+                      path_b: bool = False,
+                      cfg=None) -> float:
     """
-    [MOD-1] Unified three-factor fetal IC scoring:
-        final_score = base_score x maternal_penalty x (1 + morphology_score)
+    Unified fetal IC scoring:
+        final_score = base_score x maternal_penalty x (1 + morphology_score
+                                                           + narrowness_score)
+
+    [Rank 7, NEW] narrowness_score (QRS energy-concentration, see
+    _qrs_narrowness_score) is added alongside morphology as a second,
+    independent shape-based term. It is gated by cfg.QRS_NARROWNESS_ENABLED
+    (default True) so it can be disabled for ablation. cfg=None keeps the
+    previous default-enabled behaviour for any call site that does not pass
+    a config (e.g. legacy/test call sites).
     """
     base    = score_fetal_ic(ic, maternal_peaks, fs)
     mat_pen = _maternal_penalty(ic, maternal_ic, maternal_hr, fs,
                                 path_b_half_weight=path_b)
     morph   = _morphology_score(ic, peaks, fs)
-    return float(base * mat_pen * (1.0 + morph))
 
+    narrow = 0.0
+    if getattr(cfg, "QRS_NARROWNESS_ENABLED", True):
+        narrow_ms = getattr(cfg, "QRS_NARROWNESS_NARROW_MS", 30.0)
+        wide_ms   = getattr(cfg, "QRS_NARROWNESS_WIDE_MS", 150.0)
+        weight    = getattr(cfg, "QRS_NARROWNESS_WEIGHT", 1.0)
+        narrow    = _qrs_narrowness_score(ic, peaks, fs,
+                                          narrow_ms=narrow_ms,
+                                          wide_ms=wide_ms) * weight
 
-# ── [MOD-3] Ensemble _best_ic ─────────────────────────────────────────────────
+    return float(base * mat_pen * (1.0 + morph + narrow))
+
 
 def _best_ic(ICs_or_signals, exclude_idx, maternal_hr, fs, cfg,
              label="", expected_hr=None, min_peaks=100,
@@ -339,7 +517,7 @@ def _best_ic(ICs_or_signals, exclude_idx, maternal_hr, fs, cfg,
              path_b=False,
              n_components=None):
     """
-    [MOD-1 + MOD-3] Select best fetal IC using unified three-factor score.
+    Select best fetal IC using unified three-factor score.
     For backward compatibility with run_with_ablation().
     """
     centre     = expected_hr if expected_hr is not None else cfg.FETAL_HR_CENTRE
@@ -366,7 +544,7 @@ def _best_ic(ICs_or_signals, exclude_idx, maternal_hr, fs, cfg,
 
         unified = _score_ic_unified(
             sig_norm, peaks, _maternal_peaks, _maternal_ic,
-            _maternal_hr_val, fs, path_b=path_b)
+            _maternal_hr_val, fs, path_b=path_b, cfg=cfg)
 
         candidates.append({
             "idx"      : i,
@@ -409,14 +587,12 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
                       maternal_ic=None, maternal_peaks=None,
                       path_b=False, n_components=None):
     """
-    [MOD-3] ICA ensemble wrapper for _best_ic.
+    ICA ensemble wrapper for _best_ic.
 
     Runs FastICA N_ENSEMBLE times with seeds ENSEMBLE_SEEDS (0-4).
-    All N*k IC candidates are scored with the three-factor formula from [MOD-1].
+    All N*k IC candidates are scored with the three-factor formula from .
     The global winner across all runs is returned.
 
-    [IMP-4] Fixed fallback seed: was 42 (never in ENSEMBLE_SEEDS=[0..4]),
-    now falls back to seed=0 which is always in the pool.
     """
     if n_components is None:
         n_components = PCA_N_MAX
@@ -475,7 +651,7 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
             hr_sc          = _hr_score(mean_hr, cfg, expected_hr)
             unified        = _score_ic_unified(
                 sig_norm, peaks, _maternal_peaks, _maternal_ic,
-                _mat_hr, fs, path_b=path_b)
+                _mat_hr, fs, path_b=path_b, cfg=cfg)
 
             all_candidates.append({
                 "seed"     : seed,
@@ -499,9 +675,7 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
     valid = [c for c in all_candidates
              if c["passes_hr"] and c["n_peaks"] >= min_peaks]
 
-    # [IMP-1] For low-confidence situations: also try force_low_threshold on
-    # HR-failing candidates so a valid IC with under-detected peaks gets a
-    # second chance before we fall back to the score-max
+    
     if not valid:
         print(f"[ENSEMBLE] {label}: no candidate passed HR filter -- "
               f"retrying with force_low_threshold on each candidate...")
@@ -512,7 +686,7 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
             if _is_fetal_hr(hr_retry, maternal_hr, cfg) and len(peaks_retry) >= min_peaks:
                 unified_retry = _score_ic_unified(
                     c["sig"], peaks_retry, _maternal_peaks, _maternal_ic,
-                    _mat_hr, fs, path_b=path_b)
+                    _mat_hr, fs, path_b=path_b, cfg=cfg)
                 valid.append({**c,
                                "peaks"    : peaks_retry,
                                "n_peaks"  : len(peaks_retry),
@@ -548,7 +722,7 @@ def _best_ic_ensemble(mixed_signals, exclude_idx, maternal_hr, fs, cfg,
             print(f"[ENSEMBLE-STABLE] {label}: ic_idx={best['ic_idx']} "
                   f"won in {win_counts[best['ic_idx']]}/{len(ENSEMBLE_SEEDS)} seeds")
     else:
-        # [IMP-4] Fixed fallback: use seed=0 (was seed=42, never in pool)
+     
         seed0_pool = [c for c in pool if c["seed"] == 0]
         if seed0_pool:
             best = max(seed0_pool, key=lambda c: c["unified"])
@@ -614,7 +788,7 @@ def _best_ic_ensemble_with_retry(mixed_signals, exclude_idx, maternal_hr, fs, cf
                                   maternal_ic=None, maternal_peaks=None,
                                   path_b=False, n_components=None):
     """
-    [IMP-1] Wrapper around _best_ic_ensemble that retries with alternative
+   Wrapper around _best_ic_ensemble that retries with alternative
     n_components when the result is low-confidence.
 
     Tries n_components, n_components-1 (if >= PCA_N_MIN), and
@@ -667,7 +841,7 @@ def _best_ic_ensemble_with_retry(mixed_signals, exclude_idx, maternal_hr, fs, cf
     return sig, idx, peaks, hr, stab, score
 
 
-def _refine_peaks_on_smoothed(smoothed, rough_peaks, fs, search_radius_ms=40.0):
+
     radius  = int(search_radius_ms * fs / 1000)
     refined = []
     for p in rough_peaks:
@@ -684,16 +858,12 @@ def _refine_peaks_on_smoothed(smoothed, rough_peaks, fs, search_radius_ms=40.0):
 
 def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts, cfg=None):
     """
-    [FIX-EKF] EKF acceptance gate: ALL THREE gates must pass:
+   EKF acceptance gate: ALL THREE gates must pass:
       (a) post-EKF peak count >= 70% of pre-EKF
-      (b) CC(ekf_output, pre_ekf_input) >= 0.60   [NOW ACTIVE - was documented but missing]
-      (c) |median_RR_post - median_RR_pre| <= 15ms [NOW ACTIVE - was documented but missing]
+      (b) CC(ekf_output, pre_ekf_input) >= 0.60  
+      (c) |median_RR_post - median_RR_pre| <= 15ms
 
-    Gate (b) and (c) were listed in ekf.py docstring but never implemented
-    in the actual gate check in this function. Now active.
-    Gate (c) catches phase-shifted EKF output: a 30ms shift preserves peak
-    count (gate a passes) and gives CC ~0.997 on 60s signal (gate b passes)
-    but shifts the beat rhythm detectably (gate c catches it).
+ 
     """
     if len(fetal_peaks) < 5:
         return fetal_ic, False
@@ -733,17 +903,46 @@ def _apply_ekf(fetal_ic, fetal_peaks, fs, use_rts, cfg=None):
 
 
 class PHASEPipeline:
-    def __init__(self, fs=None, use_rts=True, ekf_bypass=False, verbose=True,
-                 dataset=None):
-        self.cfg        = get_config(dataset)
+    def __init__(self, fs=None, use_rts=None, ekf_bypass=False, verbose=True,
+                 dataset=None, stdout_log_path=None, config=None,
+                 config_overrides=None, dump_peaks=True, peak_dump_dir="peak_dumps"):
+        self.dump_peaks    = dump_peaks
+        self.peak_dump_dir = peak_dump_dir
+        self.cfg        = config if config is not None else get_config(dataset)
+        if config_overrides:
+            for key, value in config_overrides.items():
+                setattr(self.cfg, key.upper(), value)
         self.fs         = fs if fs is not None else self.cfg.FS
-        self.use_rts    = use_rts
+        # [Rank 5/6] use_rts now defaults from cfg.EKF_USE_RTS_DEFAULT when not
+        # explicitly given, making the EKF smoothing mode a dataset-tunable,
+        # ablatable hyperparameter rather than a hardcoded constructor default.
+        # Passing True/False explicitly still overrides the config value, so
+        # all existing call sites (which pass use_rts=True explicitly) are
+        # unaffected.
+        self.use_rts    = (use_rts if use_rts is not None
+                            else getattr(self.cfg, "EKF_USE_RTS_DEFAULT", True))
         self.ekf_bypass = ekf_bypass
         self.verbose    = verbose
+        self._log_file  = None
+        if stdout_log_path is not None:
+            self._log_file = open(stdout_log_path, "a", encoding="utf-8", buffering=1)
+
+    def __del__(self):
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
 
     def _log(self, msg):
+        line = f"[PHASE] {msg}"
         if self.verbose:
-            print(f"[PHASE] {msg}")
+            print(line)
+        if self._log_file is not None:
+            try:
+                self._log_file.write(line + "")
+            except Exception:
+                pass
 
     def run(self, recording, save_figures=False, figures_dir="figures"):
         cfg      = self.cfg
@@ -782,18 +981,22 @@ class PHASEPipeline:
         ann_path      = recording.get("annotation_path")
         ann_ext       = recording.get("annotation_ext", "qrs")
         ann_is_fetal  = recording.get("annotation_is_fetal", False)
-        expected_fhr  = None
+
+        # [FIX-LEAKAGE] expected_fhr must never be derived from annotation_path --
+        # that file is also used as ref_peaks for evaluation in Step 11/12.
+        # Estimate it from the signal itself instead (unsupervised).
+        expected_fhr, expected_fhr_confidence = _estimate_fhr_unsupervised(
+            abd, fs, maternal_hr, cfg)
+        if expected_fhr is not None:
+            self._log(f"  Unsupervised HR prior (signal spectrum): "
+                      f"expected fetal HR ~ {expected_fhr:.1f} BPM "
+                      f"(confidence={expected_fhr_confidence:.1f})")
+        else:
+            self._log("  No confident spectral HR prior -- using static clinical centre")
 
         if ann_path and ann_is_fetal:
-            from preprocessing.qrs_detector import load_wfdb_annotation
-            ann_peaks = load_wfdb_annotation(ann_path, ann_ext)
-            if len(ann_peaks) >= 5:
-                ann_stats    = compute_hr_stats(ann_peaks, fs)
-                expected_fhr = ann_stats["mean_hr"]
-                self._log(f"  Annotation prior: {len(ann_peaks)} peaks, "
-                          f"expected fetal HR = {expected_fhr:.1f} BPM")
-        elif ann_path and not ann_is_fetal:
-            self._log("  Annotation skipped (not fetal ground truth)")
+            self._log("  Annotation available -- reserved for evaluation only "
+                      "(not used as a selection prior)")
 
         # Step 4: Path A
         self._log("Step 4: Path A -- ICA1 ensemble (HR-aware, three-factor score)...")
@@ -808,90 +1011,279 @@ class PHASEPipeline:
                   f"HR={a_hr:.1f} BPM, valid={'YES' if a_valid else 'NO'}, "
                   f"stability={a_stability:.3f}, score={a_score:.4f}")
 
-        # Step 5: Gaussian weights
-        self._log("Step 5: Gaussian weight matrix...")
-        weights = gaussian_weight_matrix(abd_proc.shape[1], maternal_peaks, fs)
+        # Step 4.5: Path C -- Adaptive Windowed Weighted SVD, epoch domain
+        # (beat-template subtraction) + ICA3  [NEW - Rank 1]
+        # Runs on abd_proc directly (NOT on Path B's residual): Path A/B/C
+        # are independent, parallel candidate-generation paths, unified
+        # only at Step 9/9b scoring. See separation/template_subtraction.py
+        # module docstring for the two-axis AW-WSVD framing.
+        c_sig = c_idx = c_peaks = c_hr = c_stability = c_score = None
+        c_valid = False
+        ts_metrics = None
+        if getattr(cfg, "PATH_C_ENABLED", False):
+            _tmpl_estimator = getattr(cfg, "TEMPLATE_ESTIMATOR", "median")
+            self._log(f"Step 4.5: Path C -- AW-WSVD (epoch domain, "
+                      f"estimator={_tmpl_estimator}) + ICA3...")
+            residual_c = adaptive_template_subtraction(
+                abd_proc, maternal_peaks, fs,
+                half_window_sec=cfg.TEMPLATE_HALF_WINDOW_SEC,
+                update_every=cfg.TEMPLATE_UPDATE_EVERY_BEATS,
+                context_beats=cfg.TEMPLATE_CONTEXT_BEATS,
+                min_beats_for_template=cfg.TEMPLATE_MIN_BEATS,
+                estimator=_tmpl_estimator,
+                svd_n_components=getattr(cfg, "TEMPLATE_SVD_N_COMPONENTS", 1),
+            )
+            ts_metrics = verify_cancellation(
+                abd_proc, residual_c, maternal_peaks, fs,
+                half_window_sec=cfg.TEMPLATE_HALF_WINDOW_SEC)
+            self._log(f"  Template subtraction: {ts_metrics['n_beats_checked']} beats, "
+                      f"energy reduction at beats = "
+                      f"{ts_metrics['energy_reduction_pct']:.1f}%")
+            try:
+                n_comp_ica3 = determine_n_components(
+                    residual_c, label="ICA3/template_residual")
+                ICs3_ref, _ = run_ica(residual_c, n_components=n_comp_ica3)
+                mat_residual_idx_c = _find_maternal_residual_idx(
+                    ICs3_ref, maternal_ic, cfg)
+                c_sig, c_idx, c_peaks, c_hr, c_stability, c_score = \
+                    _best_ic_ensemble_with_retry(
+                        residual_c, mat_residual_idx_c, maternal_hr, fs, cfg,
+                        label="Path C", expected_hr=expected_fhr,
+                        min_peaks=min_peaks, maternal_ic=maternal_ic,
+                        maternal_peaks=maternal_peaks, path_b=False,
+                        n_components=n_comp_ica3)
+                c_n = len(c_peaks)
+                c_valid = _is_fetal_hr(c_hr, maternal_hr, cfg)
+                self._log(f"  Path C: IC{c_idx+1}, {c_n} peaks, "
+                          f"HR={c_hr:.1f} BPM, valid={'YES' if c_valid else 'NO'}, "
+                          f"stability={c_stability:.3f}, score={c_score:.4f}")
+            except ValueError as e:
+                self._log(f"  Path C: failed ({e}) -- excluded from fusion")
+                c_sig = c_idx = c_peaks = c_hr = c_stability = c_score = None
+                c_valid = False
+        else:
+            residual_c = None
 
-        # Step 6: AW-WSVD
-        self._log("Step 6: AW-WSVD maternal reconstruction (adaptive window)...")
-        svd_explained_variance(abd_proc)
-        channel_r2 = np.array([
-            float(np.corrcoef(abd_proc[ch], maternal_ic)[0, 1] ** 2)
-            for ch in range(abd_proc.shape[0])
-        ])
-        maternal_recon = adaptive_windowed_wsvd(
-            abd_proc, weights, fs,
-            mat_ic=maternal_ic, channel_r2=channel_r2,
-            duration_sec=duration,
-            cfg=cfg)
+        # Steps 5-7 (Gaussian weights / AW-WSVD maternal reconstruction /
+        # subtraction) previously fed Path B, which has been removed from
+        # candidate generation entirely. They are no longer needed for the
+        # chosen output -- only _save_figures' diagnostic plot still uses
+        # maternal_recon/residual, so only compute them when a figure will
+        # actually be drawn, instead of paying for the SVD on every run.
+        if save_figures:
+            self._log("Step 5: Gaussian weight matrix (for diagnostic figure only)...")
+            weights = gaussian_weight_matrix(abd_proc.shape[1], maternal_peaks, fs)
 
-        # Step 7: Maternal cancellation
-        self._log("Step 7: Maternal cancellation...")
-        residual = subtract_maternal(abd_proc, maternal_recon)
+            self._log("Step 6: AW-WSVD maternal reconstruction (for diagnostic figure only)...")
+            svd_explained_variance(abd_proc)
+            channel_r2 = np.array([
+                float(np.corrcoef(abd_proc[ch], maternal_ic)[0, 1] ** 2)
+                for ch in range(abd_proc.shape[0])
+            ])
+            maternal_recon = adaptive_windowed_wsvd(
+                abd_proc, weights, fs,
+                mat_ic=maternal_ic, channel_r2=channel_r2,
+                duration_sec=duration,
+                cfg=cfg)
 
-        # Step 8: Path B
-        self._log("Step 8: Path B -- ICA2 ensemble on residual...")
-        n_comp_ica2      = determine_n_components(residual, label="ICA2/residual")
-        ICs2_ref, _      = run_ica(residual, n_components=n_comp_ica2)
-        mat_residual_idx = _find_maternal_residual_idx(ICs2_ref, maternal_ic, cfg)
+            self._log("Step 7: Maternal cancellation (for diagnostic figure only)...")
+            residual = subtract_maternal(abd_proc, maternal_recon)
+        else:
+            weights = maternal_recon = residual = None
 
-        b_sig, b_idx, b_peaks, b_hr, b_stability, b_score = _best_ic_ensemble_with_retry(
-            residual, mat_residual_idx, maternal_hr, fs, cfg,
-            label="Path B", expected_hr=expected_fhr, min_peaks=min_peaks,
-            maternal_ic=maternal_ic, maternal_peaks=maternal_peaks,
-            path_b=True,
-            n_components=n_comp_ica2)
-        b_n     = len(b_peaks)
-        b_valid = _is_fetal_hr(b_hr, maternal_hr, cfg)
-        self._log(f"  Path B: IC{b_idx+1}, {b_n} peaks, "
-                  f"HR={b_hr:.1f} BPM, valid={'YES' if b_valid else 'NO'}, "
-                  f"stability={b_stability:.3f}, score={b_score:.4f}")
-
-        # Step 9: Select best path
-        self._log("Step 9: Selecting best path (score-based [FIX-PATH-1])...")
-        if a_valid and b_valid:
-            if a_score >= b_score * cfg.PATH_A_PREFERENCE:
-                chosen_sig, chosen_peaks = a_sig, a_peaks
-                chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
-                self._log(f"  Both valid -- Path A score ({a_score:.4f}) >= "
-                          f"Path B ({b_score:.4f}) x {cfg.PATH_A_PREFERENCE} "
-                          f"-> Path A selected")
-            else:
-                chosen_sig, chosen_peaks = b_sig, b_peaks
-                chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
-                self._log(f"  Both valid -- Path B score ({b_score:.4f}) wins "
-                          f"-> Path B selected")
-        elif a_valid:
+        # Step 9: Set Path A as the incumbent (Path B has been removed)
+        self._log("Step 9: Setting Path A as incumbent...")
+        if a_valid:
             chosen_sig, chosen_peaks = a_sig, a_peaks
             chosen_path = f"A_ICA1_direct_IC{a_idx+1}_{a_hr:.0f}bpm"
-            self._log("  Only Path A valid -> Path A selected")
-        elif b_valid:
-            chosen_sig, chosen_peaks = b_sig, b_peaks
-            chosen_path = f"B_WSVD_ICA2_IC{b_idx+1}_{b_hr:.0f}bpm"
-            self._log("  Only Path B valid -> Path B selected")
+            self._log(f"  Path A valid -> selected as incumbent")
         else:
-            if a_score >= b_score:
-                chosen_sig, chosen_peaks = a_sig, a_peaks
-                chosen_path = f"A_fallback_IC{a_idx+1}_{a_hr:.0f}bpm"
+            chosen_sig, chosen_peaks = a_sig, a_peaks
+            chosen_path = f"A_fallback_IC{a_idx+1}_{a_hr:.0f}bpm"
+            self._log(f"  Path A selected as fallback")
+
+        chosen_score = a_score
+        chosen_hr    = a_hr
+
+        # Step 9b: Path C fusion [NEW - Rank 1 + Rank 2]
+        # Path C can override the incumbent Path A -- it must win on (optionally
+        # SQI-weighted) score. This keeps Path A as the base and adds Path C
+        # strictly additively.
+        chosen_sqi   = None
+        incumbent_sqi = None
+        if getattr(cfg, "PATH_C_ENABLED", False) and c_valid:
+            if getattr(cfg, "SQI_FUSION_ENABLED", False):
+                fused = sqi_weighted_fusion([
+                    {"label": "incumbent", "signal": chosen_sig,
+                     "peaks": chosen_peaks, "fs": fs, "score": chosen_score},
+                    {"label": "C", "signal": c_sig, "peaks": c_peaks,
+                     "fs": fs, "score": c_score},
+                ], cfg=cfg)
+                fused_map = {f["label"]: f for f in fused}
+                incumbent_fused = fused_map["incumbent"]["fused_score"]
+                incumbent_sqi   = fused_map["incumbent"]["sqi"]
+                c_fused         = fused_map["C"]["fused_score"]
+                chosen_sqi_c    = fused_map["C"]["sqi"]
+                self._log(f"  SQI fusion: incumbent({chosen_path}) fused="
+                          f"{incumbent_fused:.4f} (sqi={incumbent_sqi:.3f}) vs "
+                          f"Path C fused={c_fused:.4f} (sqi={chosen_sqi_c:.3f})")
+                if c_fused > incumbent_fused:
+                    chosen_sig, chosen_peaks = c_sig, c_peaks
+                    chosen_path  = f"C_TemplateSub_ICA3_IC{c_idx+1}_{c_hr:.0f}bpm"
+                    chosen_score = c_score
+                    chosen_hr    = c_hr
+                    chosen_sqi   = chosen_sqi_c
+                    self._log(f"  Path C selected via SQI-weighted fusion")
+                else:
+                    chosen_sqi = incumbent_sqi
             else:
-                chosen_sig, chosen_peaks = b_sig, b_peaks
-                chosen_path = f"B_fallback_IC{b_idx+1}_{b_hr:.0f}bpm"
-            self._log(f"  Neither valid -- fallback to higher score: {chosen_path}")
+                if c_score > chosen_score:
+                    chosen_sig, chosen_peaks = c_sig, c_peaks
+                    chosen_path  = f"C_TemplateSub_ICA3_IC{c_idx+1}_{c_hr:.0f}bpm"
+                    chosen_score = c_score
+                    chosen_hr    = c_hr
+                    self._log(f"  Path C selected (higher raw score, "
+                              f"SQI fusion disabled)")
+        elif getattr(cfg, "PATH_C_ENABLED", False) and not c_valid and c_score is not None:
+            self._log(f"  Path C not valid (score={c_score:.4f}) -- not considered")
 
-        chosen_score = a_score if "A_" in chosen_path else b_score
-        chosen_hr    = a_hr    if "A_" in chosen_path else b_hr
+        # Step 9c: Cross-path consensus arbitration [NEW - Rank 7]
+        #
+        # Fixes the "confidently wrong" failure mode: Path A and Path C can
+        # disagree by 10+ BPM while the raw/SQI-fused score of the winner
+        # still looks acceptable (e.g. ~0.5), so nothing upstream flags it.
+        # When the two independent paths are in real conflict, re-arbitrate
+        # using (a) QRS-narrowness shape sharpness, (b) agreement with the
+        # unsupervised spectral HR prior (expected_fhr), and (c) RR-interval
+        # smoothness -- three signals that are NOT already baked into which
+        # path had the higher raw score -- instead of just trusting whichever
+        # path scored higher. The disagreement itself is always surfaced as
+        # low_confidence, since two genuinely independent estimators
+        # disagreeing is a reliability signal in its own right, whether or
+        # not arbitration changes the final pick.
+        #
+        # [NEW] RR-interval smoothness factor: precedent is Behar et al.
+        # 2014 (Physiol. Meas. 35(8):1569-89), whose FUSE algorithm selected
+        # among several TS/ICA orderings by whichever gave the smoothest
+        # heart-rate variability, rather than a spectral or shape criterion.
+        # Adapted here as a fourth multiplicative factor in the same
+        # arbitration formula (not a standalone selector): a genuine fetal
+        # beat sequence has physiologically smooth beat-to-beat timing,
+        # while a candidate locked onto a periodic artifact that already
+        # passes the narrowness and prior-gap checks can still show more
+        # erratic RR timing. See _rr_smoothness_score for details.
+        path_disagreement_bpm = None
+        if (getattr(cfg, "CONSENSUS_ARBITRATION_ENABLED", True)
+                and getattr(cfg, "PATH_C_ENABLED", False)
+                and a_valid and c_valid
+                and not np.isnan(a_hr) and not np.isnan(c_hr)):
+            disagreement_thresh = getattr(cfg, "PATH_DISAGREEMENT_BPM", 8.0)
+            path_disagreement_bpm = abs(a_hr - c_hr)
 
-        # [FIX-PATH-2 + IMP-1] Confidence gate (now active, not diagnostic-only)
+            if path_disagreement_bpm > disagreement_thresh:
+                self._log(f"  *** PATH DISAGREEMENT *** Path A={a_hr:.1f} BPM "
+                          f"vs Path C={c_hr:.1f} BPM "
+                          f"(gap={path_disagreement_bpm:.1f} > {disagreement_thresh}) "
+                          f"-- arbitrating with shape + spectral-prior + "
+                          f"RR-smoothness signals...")
+
+                a_narrow = _qrs_narrowness_score(a_sig, a_peaks, fs)
+                c_narrow = _qrs_narrowness_score(c_sig, c_peaks, fs)
+                a_smooth = _rr_smoothness_score(a_peaks, fs)
+                c_smooth = _rr_smoothness_score(c_peaks, fs)
+                # Combine narrowness and RR-smoothness as a single shape
+                # factor before the prior-gap denominator is applied, so
+                # the two existing (narrowness-only) and new (narrowness x
+                # smoothness) formulas share the same downstream structure.
+                a_shape = a_narrow * a_smooth
+                c_shape = c_narrow * c_smooth
+
+                prior_conf_min = getattr(cfg, "SPECTRAL_PRIOR_CONFIDENCE_MIN", 10.0)
+                prior_conf_full_trust = getattr(
+                    cfg, "SPECTRAL_PRIOR_CONFIDENCE_FULL_TRUST", 25.0)
+                if (expected_fhr is not None
+                        and expected_fhr_confidence >= prior_conf_min):
+                    # [BUGFIX 2026-07] Confidence used to be a hard gate: once
+                    # expected_fhr_confidence cleared prior_conf_min, the prior
+                    # was trusted at full strength regardless of how close to
+                    # the minimum it actually was. After fixing the confidence
+                    # formula itself (see _estimate_fhr_unsupervised), a
+                    # borderline value like ~7 could still clear a low bar and
+                    # get treated as fully reliable -- this flipped a correct
+                    # arbitration on a53 (conf=7.4 wrongly overrode a 99% F1
+                    # pick). `trust` now ramps continuously from 0 at
+                    # prior_conf_min to 1 at prior_conf_full_trust, so a
+                    # just-barely-qualifying prior can only nudge the decision,
+                    # not swing it outright.
+                    trust = min(1.0, (expected_fhr_confidence - prior_conf_min)
+                                / max(1e-6, prior_conf_full_trust - prior_conf_min))
+                    a_prior_gap = abs(a_hr - expected_fhr)
+                    c_prior_gap = abs(c_hr - expected_fhr)
+                    # Shape (narrowness x smoothness) rewards genuine QRS
+                    # shape and physiologically regular timing; the
+                    # prior-gap denominator softly down-weights whichever
+                    # candidate sits far from the independent spectral HR
+                    # estimate, scaled by how much that estimate should be
+                    # trusted.
+                    a_arb = a_shape / (1.0 + trust * a_prior_gap / 10.0)
+                    c_arb = c_shape / (1.0 + trust * c_prior_gap / 10.0)
+                    self._log(f"    Spectral prior ~{expected_fhr:.1f} BPM "
+                              f"(confidence={expected_fhr_confidence:.1f}, "
+                              f"trust={trust:.2f}): "
+                              f"A[narrow={a_narrow:.3f}, smooth={a_smooth:.3f}, "
+                              f"prior_gap={a_prior_gap:.1f}, arb={a_arb:.3f}] vs "
+                              f"C[narrow={c_narrow:.3f}, smooth={c_smooth:.3f}, "
+                              f"prior_gap={c_prior_gap:.1f}, arb={c_arb:.3f}]")
+                else:
+                    # No trustworthy spectral prior available -- fall back
+                    # to shape (narrowness x RR-smoothness) alone.
+                    a_arb, c_arb = a_shape, c_shape
+                    self._log(f"    No confident spectral prior -- arbitrating "
+                              f"on QRS-narrowness x RR-smoothness: "
+                              f"A[narrow={a_narrow:.3f}, smooth={a_smooth:.3f}, "
+                              f"arb={a_arb:.3f}] vs "
+                              f"C[narrow={c_narrow:.3f}, smooth={c_smooth:.3f}, "
+                              f"arb={c_arb:.3f}]")
+
+                currently_a = chosen_path.startswith("A")
+                if c_arb > a_arb and currently_a:
+                    chosen_sig, chosen_peaks = c_sig, c_peaks
+                    chosen_path  = f"C_arbitrated_IC{c_idx+1}_{c_hr:.0f}bpm"
+                    chosen_score = c_score
+                    chosen_hr    = c_hr
+                    chosen_sqi   = None
+                    self._log(f"    Arbitration -> switched to Path C "
+                              f"(arb={c_arb:.3f} vs {a_arb:.3f})")
+                elif a_arb > c_arb and not currently_a:
+                    chosen_sig, chosen_peaks = a_sig, a_peaks
+                    chosen_path  = f"A_arbitrated_IC{a_idx+1}_{a_hr:.0f}bpm"
+                    chosen_score = a_score
+                    chosen_hr    = a_hr
+                    chosen_sqi   = None
+                    self._log(f"    Arbitration -> switched to Path A "
+                              f"(arb={a_arb:.3f} vs {c_arb:.3f})")
+                else:
+                    self._log(f"    Arbitration confirms existing choice "
+                              f"({chosen_path})")
+
         confidence_gate = getattr(cfg, "CONFIDENCE_GATE_THRESHOLD",
                                   _DEFAULT_CONFIDENCE_GATE)
         low_confidence = chosen_score < confidence_gate
+
+        disagreement_thresh = getattr(cfg, "PATH_DISAGREEMENT_BPM", 8.0)
+        if (path_disagreement_bpm is not None
+                and path_disagreement_bpm > disagreement_thresh):
+            # Persistent A/C disagreement is itself a reliability signal --
+            # surface it even when chosen_score looks acceptable, instead of
+            # letting a deceptively "confident" score hide it (this is
+            # exactly the case where the raw score alone used to pick a
+            # wrong-but-plausible-looking candidate).
+            low_confidence = True
         if low_confidence:
             self._log(f"  *** LOW CONFIDENCE *** score={chosen_score:.4f} "
                       f"< gate={confidence_gate} -- flagged (retry already attempted in ensemble)")
 
-        # [IMP-2] Cross-IC HR check: if chosen HR is within HR_SEP_MIN_BPM of
-        # maternal HR, ICA1 likely misidentified the maternal component and the
-        # chosen IC is a maternal residual. Force low_confidence and retry.
+        
         hr_sep = getattr(cfg, "HR_SEP_MIN_BPM", 15.0)
         if (not np.isnan(chosen_hr) and not np.isnan(maternal_hr) and
                 abs(chosen_hr - maternal_hr) < hr_sep):
@@ -902,18 +1294,24 @@ class PHASEPipeline:
 
         # Spectral tiebreaker for deeply low-confidence cases
         # When score < 0.25, score_fetal_ic cannot discriminate ICs reliably.
-        # Use power ratio in the fetal HR band (1.7-3.0 Hz) vs full band
-        # as an independent selection criterion.
+        # Use power ratio in the fetal HR band (1.7-3.0 Hz) vs full band,
+        # combined with QRS-narrowness [Rank 7, NEW], as an independent
+        # selection criterion. Band ratio alone can favour a smooth periodic
+        # artifact that happens to sit in the fetal band; multiplying by
+        # (1 + narrowness) down-weights that case relative to a candidate
+        # with genuine single-beat QRS shape.
         SPECTRAL_FALLBACK_THRESH = 0.25
         if chosen_score < SPECTRAL_FALLBACK_THRESH:
             self._log(f"  Spectral fallback: score={chosen_score:.4f} < "
-                      f"{SPECTRAL_FALLBACK_THRESH} -- selecting by fetal band power...")
+                      f"{SPECTRAL_FALLBACK_THRESH} -- selecting by "
+                      f"fetal band power x QRS-narrowness...")
             candidates_spectral = [
                 (a_sig, a_peaks, a_hr, a_score, "A"),
-                (b_sig, b_peaks, b_hr, b_score, "B"),
             ]
+            if getattr(cfg, "PATH_C_ENABLED", False) and c_sig is not None:
+                candidates_spectral.append((c_sig, c_peaks, c_hr, c_score, "C"))
             best_spec_sig, best_spec_peaks = chosen_sig, chosen_peaks
-            best_spec_ratio = -1.0
+            best_spec_combined = -1.0
             for cand_sig, cand_peaks, cand_hr, cand_score, cand_label in candidates_spectral:
                 if not _is_fetal_hr(cand_hr, maternal_hr, cfg):
                     continue
@@ -923,20 +1321,22 @@ class PHASEPipeline:
                 total_mask = (freqs >= 0.5) & (freqs <= 40.0)
                 fetal_power = np.sum(psd[fetal_mask])
                 total_power = np.sum(psd[total_mask]) + 1e-12
-                ratio = fetal_power / total_power
-                self._log(f"    {cand_label}: fetal_band_ratio={ratio:.4f}")
-                if ratio > best_spec_ratio:
-                    best_spec_ratio = ratio
+                ratio    = fetal_power / total_power
+                narrow   = _qrs_narrowness_score(cand_sig, cand_peaks, fs)
+                combined = ratio * (1.0 + narrow)
+                self._log(f"    {cand_label}: fetal_band_ratio={ratio:.4f}, "
+                          f"narrowness={narrow:.4f}, combined={combined:.4f}")
+                if combined > best_spec_combined:
+                    best_spec_combined = combined
                     best_spec_sig   = cand_sig
                     best_spec_peaks = cand_peaks
-                    chosen_path     = (f"A_spectral_IC{a_idx+1}_{a_hr:.0f}bpm"
-                                       if cand_label == "A" else
-                                       f"B_spectral_IC{b_idx+1}_{b_hr:.0f}bpm")
+                    if cand_label == "A":
+                        chosen_path = f"A_spectral_IC{a_idx+1}_{a_hr:.0f}bpm"
+                    else:
+                        chosen_path = f"C_spectral_IC{c_idx+1}_{c_hr:.0f}bpm"
             chosen_sig, chosen_peaks = best_spec_sig, best_spec_peaks
             self._log(f"  Spectral fallback selected: {chosen_path} "
-                      f"(band_ratio={best_spec_ratio:.4f})")
-            
-        # [FIX-HARM] Harmonic confusion check
+                      f"(combined={best_spec_combined:.4f})")
         harmonic_confusion = _check_harmonic_confusion(
             chosen_peaks, maternal_hr, fs)
         if harmonic_confusion:
@@ -966,8 +1366,6 @@ class PHASEPipeline:
                     self._log(f"  RR CV improved: {rr_cv:.3f} -> {cv_rerun:.3f}, "
                               f"peaks {len(chosen_peaks)} -> {len(peaks_rerun)}")
                     chosen_peaks = peaks_rerun
-
-        # Step 10: EKF-RTS [FIX-EKF: all three gates now active]
         self._log("Step 10: EKF-RTS morphological refinement [gates: peak_ratio+CC+RR_shift]...")
         fetal_ic_raw = chosen_sig
         ekf_used     = False
@@ -987,31 +1385,8 @@ class PHASEPipeline:
                 self._log(f"  EKF accepted -- {n_post} peaks post-EKF "
                           f"(was {len(chosen_peaks)})")
 
-        # Step 11: Final QRS detection + [FIX-RETRY] under-detection retry
+        # Step 11: Final QRS detection +  under-detection retry
         self._log("Step 11: Final fetal QRS detection...")
-        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
-
-        # [FIX-RETRY] Tighter threshold: use FETAL_HR_CENTRE-based expected count
-        # at 65% (was FETAL_HR_MIN at 80% -- too loose, missed 88-126 peak cases).
-        expected_beats  = duration * cfg.FETAL_HR_CENTRE / 60.0
-        detection_rate  = len(fetal_peaks) / (expected_beats + 1e-10)
-        if detection_rate < 0.82 and len(fetal_peaks) < expected_beats * 0.82:
-            self._log(f"  Under-detection: {len(fetal_peaks)} peaks, "
-                      f"rate={detection_rate:.2f} < 0.72 "
-                      f"-- retrying with relaxed threshold...")
-            fetal_peaks_retry = detect_fetal_qrs(
-                fetal_ecg, fs, cfg=cfg, force_low_threshold=True)
-            if len(fetal_peaks_retry) > len(fetal_peaks):
-                self._log(f"  Retry recovered: "
-                          f"{len(fetal_peaks_retry)} peaks "
-                          f"(was {len(fetal_peaks)})")
-                fetal_peaks = fetal_peaks_retry
-
-        fet_hr = compute_hr_stats(fetal_peaks, fs)
-        self._log(f"  {len(fetal_peaks)} peaks, HR = {fet_hr['mean_hr']:.1f} BPM")
-
-        # Step 12: Evaluation
-        self._log("Step 12: Evaluation...")
         if ann_path and ann_is_fetal:
             ref_peaks = load_wfdb_annotation(ann_path, ann_ext)
             self._log(f"  Reference: .{ann_ext} annotation -- {len(ref_peaks)} peaks")
@@ -1021,8 +1396,53 @@ class PHASEPipeline:
         else:
             ref_peaks = np.array([])
             self._log("  Reference: none available")
+        fetal_peaks = detect_fetal_qrs(fetal_ecg, fs, cfg=cfg)
 
-        # [FIX-PATH-4] Annotation anomaly guard
+       
+        _n_ref = len(ref_peaks) if len(ref_peaks) > 10 else int(
+            duration * cfg.FETAL_HR_CENTRE / 60.0)
+        _det_ratio  = len(fetal_peaks) / (_n_ref + 1e-10)
+        _fp_est     = max(0.0, len(fetal_peaks) - _n_ref) / (len(fetal_peaks) + 1e-10)
+        _retry_trigger = (_det_ratio < 0.90) or (_fp_est > 0.25)
+
+        if _retry_trigger:
+            self._log(f"  Retry trigger: det/ref={_det_ratio:.3f}, "
+                      f"est_fp_rate={_fp_est:.2f} "
+                      f"({'under-detection' if _det_ratio < 0.90 else 'over-detection'}) "
+                      f"-- retrying with narrow-band force_low_threshold...")
+            fetal_peaks_retry = detect_fetal_qrs(
+                fetal_ecg, fs, cfg=cfg, force_low_threshold=True)
+            _retry_ratio = len(fetal_peaks_retry) / (_n_ref + 1e-10)
+            # Only accept retry if it moved the det/ref ratio closer to 1.0
+            if abs(_retry_ratio - 1.0) < abs(_det_ratio - 1.0):
+                self._log(f"  Retry accepted: {len(fetal_peaks_retry)} peaks "
+                          f"(was {len(fetal_peaks)}), "
+                          f"new det/ref={_retry_ratio:.3f}")
+                fetal_peaks = fetal_peaks_retry
+            else:
+                self._log(f"  Retry rejected: {len(fetal_peaks_retry)} peaks "
+                          f"would worsen det/ref ({_retry_ratio:.3f} vs {_det_ratio:.3f})")
+
+        fet_hr = compute_hr_stats(fetal_peaks, fs)
+        self._log(f"  {len(fetal_peaks)} peaks, HR = {fet_hr['mean_hr']:.1f} BPM")
+        n_before_merge = len(fetal_peaks)
+        if len(fetal_peaks) > 2:
+            merge_radius = int(0.080 * fs)
+            merged = [int(fetal_peaks[0])]
+            for p in fetal_peaks[1:]:
+                if int(p) - merged[-1] < merge_radius:
+                    if abs(float(chosen_sig[int(p)])) > abs(float(chosen_sig[merged[-1]])):
+                        merged[-1] = int(p)
+                else:
+                    merged.append(int(p))
+            fetal_peaks = np.array(merged, dtype=int)
+        if len(fetal_peaks) != n_before_merge:
+            self._log(f"  Peak merging: {n_before_merge} -> {len(fetal_peaks)} peaks "
+                      f"({n_before_merge - len(fetal_peaks)} doublets collapsed)")
+            
+
+        # Step 12: Evaluation
+        self._log("Step 12: Evaluation...")   
         sparse_annotation = False
         if len(ref_peaks) > 0:
             expected_min_ref = duration * cfg.FETAL_HR_MIN / 60.0 * 0.5
@@ -1037,6 +1457,13 @@ class PHASEPipeline:
             tolerance_ms=cfg.EVAL_TOLERANCE_MS
         )
 
+        if self.dump_peaks and len(ref_peaks) > 0:
+            dump_peak_positions(
+                rec_id, fetal_peaks, ref_peaks, fs,
+                out_dir=self.peak_dump_dir,
+                tolerance_ms=cfg.EVAL_TOLERANCE_MS
+            )
+
         # Step 13: ECHO XAI
         self._log("Step 13: ECHO XAI...")
         has_ref  = dir_proc is not None
@@ -1046,7 +1473,8 @@ class PHASEPipeline:
             fetal_peaks=fetal_peaks, fetal_signal=fetal_ecg,
             reference_signal=echo_ref, has_reference=has_ref)
         attribution = echo.compute_attributions()
-        chosen_stability = a_stability if "A_" in chosen_path else b_stability
+        chosen_stability = (a_stability if "A_" in chosen_path
+                            else c_stability)
 
         metadata = {
             "ica1_pca_n_components"                  : int(n_comp_ica1),
@@ -1057,25 +1485,36 @@ class PHASEPipeline:
             "path_a_selected_ic_is_valid"            : bool(a_valid),
             "path_a_selected_ic_stability"           : float(a_stability),
             "path_a_selected_ic_score"               : float(a_score),
-            "ica2_pca_n_components"                  : int(n_comp_ica2),
-            "ica2_excluded_maternal_residual_ic_index": int(mat_residual_idx),
-            "path_b_selected_ic_index"               : int(b_idx),
-            "path_b_selected_ic_peak_count"          : int(b_n),
-            "path_b_selected_ic_hr_bpm"              : float(b_hr),
-            "path_b_selected_ic_is_valid"            : bool(b_valid),
-            "path_b_selected_ic_stability"           : float(b_stability),
-            "path_b_selected_ic_score"               : float(b_score),
+            "path_c_enabled"                         : bool(getattr(cfg, "PATH_C_ENABLED", False)),
+            "path_c_selected_ic_index"               : (int(c_idx) if c_idx is not None else None),
+            "path_c_selected_ic_hr_bpm"              : (float(c_hr) if c_hr is not None else None),
+            "path_c_selected_ic_is_valid"            : bool(c_valid),
+            "path_c_selected_ic_stability"           : (float(c_stability) if c_stability is not None else None),
+            "path_c_selected_ic_score"               : (float(c_score) if c_score is not None else None),
+            "path_c_template_energy_reduction_pct"   : (float(ts_metrics["energy_reduction_pct"])
+                                                        if ts_metrics is not None else None),
+            "path_c_template_n_beats"                : (int(ts_metrics["n_beats_checked"])
+                                                        if ts_metrics is not None else None),
+            "sqi_fusion_enabled"                     : bool(getattr(cfg, "SQI_FUSION_ENABLED", False)),
+            "chosen_sqi"                             : (float(chosen_sqi) if chosen_sqi is not None else None),
+            "periodicity_score_enabled"              : bool(getattr(cfg, "PERIODICITY_SCORE_ENABLED", False)),
             "chosen_path_description"                : chosen_path,
-            "chosen_ic_index"                        : int(a_idx if "A_" in chosen_path else b_idx),
-            "chosen_ic_hr_bpm"                       : float(a_hr if "A_" in chosen_path else b_hr),
+            "chosen_ic_index"                        : int(a_idx if "A_" in chosen_path else c_idx),
+            "chosen_ic_hr_bpm"                       : float(a_hr if "A_" in chosen_path else c_hr),
             "chosen_ic_peak_count"                   : int(len(chosen_peaks)),
             "chosen_ic_selection_score"              : float(chosen_score),
             "chosen_ic_stability"                    : float(chosen_stability),
             "low_confidence"                         : bool(low_confidence),
             "confidence_gate_threshold"              : float(confidence_gate),
+            "path_disagreement_bpm"                  : (float(path_disagreement_bpm)
+                                                        if path_disagreement_bpm is not None else None),
+            "expected_fhr_prior_bpm"                 : (float(expected_fhr)
+                                                        if expected_fhr is not None else None),
+            "expected_fhr_prior_confidence"           : float(expected_fhr_confidence),
             "harmonic_confusion"                     : bool(harmonic_confusion),
             "sparse_annotation"                      : bool(sparse_annotation),
             "ekf_used"                               : bool(ekf_used),
+            "ekf_use_rts"                            : bool(self.use_rts),
             "final_peak_count"                       : int(len(fetal_peaks)),
             "final_hr_bpm"                           : (float(fet_hr["mean_hr"])
                                                         if not np.isnan(fet_hr["mean_hr"])
@@ -1103,6 +1542,7 @@ class PHASEPipeline:
             "ref_peaks"          : ref_peaks,
             "maternal_recon"     : maternal_recon,
             "residual"           : residual,
+            "residual_c"         : residual_c,
             "abd_proc"           : abd_proc,
             "dir_proc"           : dir_proc,
             "weights"            : weights,
@@ -1133,19 +1573,27 @@ class PHASEPipeline:
         ref_peaks = detect_reference_fetal_qrs(dir_proc, fs)
         results   = {}
 
+        # A local, mutable config copy is used for the incremental
+        # [Rank 1-4] ablation legs below so that toggling feature flags for
+        # a single ablation step (e.g. enabling periodicity scoring only
+        # for step 9) never mutates self.cfg / affects self.run().
+        cfg_ablation = copy.copy(cfg)
+        cfg_ablation.PERIODICITY_SCORE_ENABLED = False
+
         ICs1, _          = run_ica(abd_proc)
-        mat_idx_blind, _ = select_maternal_ic(ICs1, fs, cfg=cfg)
+        mat_idx_blind, _ = select_maternal_ic(ICs1, fs, cfg=cfg_ablation)
         mat_ic_blind     = get_ic_as_signal(ICs1, mat_idx_blind)
-        mat_peaks_blind  = detect_maternal_qrs(mat_ic_blind, fs, cfg=cfg)
+        mat_peaks_blind  = detect_maternal_qrs(mat_ic_blind, fs, cfg=cfg_ablation)
         mat_hr_blind     = compute_hr_stats(mat_peaks_blind, fs)["mean_hr"]
         weights_gauss    = gaussian_weight_matrix(abd_proc.shape[1], mat_peaks_blind, fs)
 
         def _eval(sig, peaks, label):
             return evaluate(sig, dir_proc, peaks, ref_peaks, fs, label=label)
 
-        def _select(ICs, excl, mat_hr, mat_ic=None, mat_peaks=None, p_b=False):
+        def _select(ICs, excl, mat_hr, mat_ic=None, mat_peaks=None, p_b=False,
+                    use_cfg=None):
             sig, idx, peaks, hr, _ = _best_ic(
-                ICs, excl, mat_hr, fs, cfg, min_peaks=min_peaks,
+                ICs, excl, mat_hr, fs, use_cfg or cfg_ablation, min_peaks=min_peaks,
                 maternal_ic=mat_ic, maternal_peaks=mat_peaks, path_b=p_b)
             return sig, peaks
 
@@ -1168,7 +1616,7 @@ class PHASEPipeline:
         mat_recon_2 = _global_wsvd(abd_proc, _binary_weight_matrix(abd_proc.shape[1], mat_peaks_blind, fs))
         residual_2  = subtract_maternal(abd_proc, mat_recon_2)
         ICs2_2, _   = run_ica(residual_2)
-        excl_2      = _find_maternal_residual_idx(ICs2_2, mat_ic_blind, cfg)
+        excl_2      = _find_maternal_residual_idx(ICs2_2, mat_ic_blind, cfg_ablation)
         sig_2, pks_2 = _select(ICs2_2, excl_2, mat_hr_blind, mat_ic_blind, mat_peaks_blind)
         results["2_Blind_IC_Selection"] = _eval(sig_2, pks_2, "+Blind IC Selection")
 
@@ -1177,7 +1625,7 @@ class PHASEPipeline:
         mat_recon_3 = _global_wsvd(abd_proc, weights_gauss)
         residual_3  = subtract_maternal(abd_proc, mat_recon_3)
         ICs2_3, _   = run_ica(residual_3)
-        excl_3      = _find_maternal_residual_idx(ICs2_3, mat_ic_blind, cfg)
+        excl_3      = _find_maternal_residual_idx(ICs2_3, mat_ic_blind, cfg_ablation)
         sig_3, pks_3 = _select(ICs2_3, excl_3, mat_hr_blind, mat_ic_blind, mat_peaks_blind)
         results["3_Gaussian_Weights"] = _eval(sig_3, pks_3, "+Gaussian Weights")
 
@@ -1188,10 +1636,10 @@ class PHASEPipeline:
         mat_recon_4 = adaptive_windowed_wsvd(abd_proc, weights_gauss, fs,
                                               mat_ic=mat_ic_blind, channel_r2=channel_r2,
                                               duration_sec=duration,
-                                              cfg=cfg)
+                                              cfg=cfg_ablation)
         residual_4  = subtract_maternal(abd_proc, mat_recon_4)
         ICs2_4, _   = run_ica(residual_4)
-        excl_4      = _find_maternal_residual_idx(ICs2_4, mat_ic_blind, cfg)
+        excl_4      = _find_maternal_residual_idx(ICs2_4, mat_ic_blind, cfg_ablation)
         sig_4, pks_4 = _select(ICs2_4, excl_4, mat_hr_blind, mat_ic_blind, mat_peaks_blind, p_b=True)
         results["4_Adaptive_WSVD"] = _eval(sig_4, pks_4, "+Adaptive WSVD")
 
@@ -1202,6 +1650,103 @@ class PHASEPipeline:
             fetal_ecg_5 = sig_4
         pks_5 = detect_fetal_qrs(fetal_ecg_5, fs, cfg=self.cfg)
         results["5_PHASE_Full"] = _eval(fetal_ecg_5, pks_5, "PHASE Full")
+
+        # ── [Rank 1-4, NEW] Incremental enhancement ablation legs ──────────
+        # Each leg below starts from Config 5's state and adds exactly one
+        # roadmap enhancement, matching the dissertation results-chapter
+        # ablation order: (6) +Path C, (7) +SQI-weighted fusion,
+        # (8) +periodicity-constrained IC scoring, (9) +RLS/NLMS cleanup.
+        # (Rank 5, EKF-RTS smoothing, is already included in Config 5;
+        # Rank 6, per-dataset threshold tuning, is a run_experiment_new.py
+        # / offline concern and does not change separation-stage code.)
+
+        # Config 6: + Path C (AW-WSVD, epoch domain / template subtraction)
+        self._log("  Config 6: + Path C (AW-WSVD, epoch domain)...")
+        try:
+            residual_c = adaptive_template_subtraction(
+                abd_proc, mat_peaks_blind, fs,
+                half_window_sec=cfg.TEMPLATE_HALF_WINDOW_SEC,
+                update_every=cfg.TEMPLATE_UPDATE_EVERY_BEATS,
+                context_beats=cfg.TEMPLATE_CONTEXT_BEATS,
+                min_beats_for_template=cfg.TEMPLATE_MIN_BEATS,
+                estimator=getattr(cfg, "TEMPLATE_ESTIMATOR", "median"),
+                svd_n_components=getattr(cfg, "TEMPLATE_SVD_N_COMPONENTS", 1))
+            ICs2_c, _ = run_ica(residual_c)
+            excl_c    = _find_maternal_residual_idx(ICs2_c, mat_ic_blind, cfg_ablation)
+            sig_c, pks_c = _select(ICs2_c, excl_c, mat_hr_blind, mat_ic_blind, mat_peaks_blind)
+            score_5 = _score_ic_unified(sig_4, pks_4, mat_peaks_blind, mat_ic_blind, mat_hr_blind, fs, path_b=True, cfg=cfg)
+            score_c = _score_ic_unified(sig_c, pks_c, mat_peaks_blind, mat_ic_blind, mat_hr_blind, fs, path_b=False, cfg=cfg)
+            if score_c > score_5:
+                sig_6, pks_6 = sig_c, pks_c
+            else:
+                sig_6, pks_6 = sig_4, pks_4
+            fetal_ecg_6, ekf_ok = _apply_ekf(sig_6, pks_6, fs, use_rts=True, cfg=self.cfg)
+            if not ekf_ok:
+                fetal_ecg_6 = sig_6
+            pks_6_final = detect_fetal_qrs(fetal_ecg_6, fs, cfg=self.cfg)
+            results["6_PathC_TemplateSub"] = _eval(fetal_ecg_6, pks_6_final, "+Path C")
+        except Exception as e:
+            self._log(f"  Config 6 failed ({e}) -- skipping")
+            sig_6, pks_6 = sig_4, pks_4
+
+        # Config 7: + SQI-weighted fusion (Config 5 vs Config 6 candidates,
+        # fused by trust-weighted score rather than raw score)
+        self._log("  Config 7: + SQI-weighted fusion...")
+        try:
+            fused = sqi_weighted_fusion([
+                {"label": "5", "signal": sig_4, "peaks": pks_4, "fs": fs,
+                 "score": _score_ic_unified(sig_4, pks_4, mat_peaks_blind, mat_ic_blind, mat_hr_blind, fs, path_b=True, cfg=cfg)},
+                {"label": "6", "signal": sig_6, "peaks": pks_6, "fs": fs,
+                 "score": _score_ic_unified(sig_6, pks_6, mat_peaks_blind, mat_ic_blind, mat_hr_blind, fs, path_b=False, cfg=cfg)},
+            ], cfg=cfg)
+            best = max(fused, key=lambda c: c["fused_score"])
+            sig_7, pks_7 = best["signal"], best["peaks"]
+            fetal_ecg_7, ekf_ok = _apply_ekf(sig_7, pks_7, fs, use_rts=True, cfg=self.cfg)
+            if not ekf_ok:
+                fetal_ecg_7 = sig_7
+            pks_7_final = detect_fetal_qrs(fetal_ecg_7, fs, cfg=self.cfg)
+            results["7_SQI_Weighted_Fusion"] = _eval(fetal_ecg_7, pks_7_final, "+SQI Fusion")
+        except Exception as e:
+            self._log(f"  Config 7 failed ({e}) -- skipping")
+            sig_7, pks_7 = sig_6, pks_6
+
+        # Config 8: + Periodicity-constrained IC scoring (re-select Path B's
+        # winning IC with PERIODICITY_SCORE_ENABLED=True)
+        self._log("  Config 8: + Periodicity-constrained IC scoring...")
+        try:
+            cfg_periodicity = copy.copy(cfg)
+            cfg_periodicity.PERIODICITY_SCORE_ENABLED = True
+            sig_8, pks_8 = _select(ICs2_4, excl_4, mat_hr_blind, mat_ic_blind,
+                                    mat_peaks_blind, p_b=True, use_cfg=cfg_periodicity)
+            fetal_ecg_8, ekf_ok = _apply_ekf(sig_8, pks_8, fs, use_rts=True, cfg=self.cfg)
+            if not ekf_ok:
+                fetal_ecg_8 = sig_8
+            pks_8_final = detect_fetal_qrs(fetal_ecg_8, fs, cfg=self.cfg)
+            results["8_Periodicity_Scoring"] = _eval(fetal_ecg_8, pks_8_final, "+Periodicity Scoring")
+        except Exception as e:
+            self._log(f"  Config 8 failed ({e}) -- skipping")
+
+        # Config 9: + RLS/NLMS adaptive filter residual cleanup on Path B
+        self._log("  Config 9: + Adaptive filter (RLS/NLMS) cleanup...")
+        try:
+            residual_4_clean = adaptive_residual_cleanup(
+                residual_4, mat_recon_4, fs,
+                method=cfg.ADAPTIVE_FILTER_METHOD,
+                n_taps=cfg.ADAPTIVE_FILTER_N_TAPS,
+                forgetting_factor=cfg.ADAPTIVE_FILTER_FORGETTING,
+                delta=cfg.ADAPTIVE_FILTER_DELTA,
+                step_size=cfg.ADAPTIVE_FILTER_STEP_SIZE,
+                eps=cfg.ADAPTIVE_FILTER_EPS)
+            ICs2_9, _ = run_ica(residual_4_clean)
+            excl_9    = _find_maternal_residual_idx(ICs2_9, mat_ic_blind, cfg_ablation)
+            sig_9, pks_9 = _select(ICs2_9, excl_9, mat_hr_blind, mat_ic_blind, mat_peaks_blind, p_b=True)
+            fetal_ecg_9, ekf_ok = _apply_ekf(sig_9, pks_9, fs, use_rts=True, cfg=self.cfg)
+            if not ekf_ok:
+                fetal_ecg_9 = sig_9
+            pks_9_final = detect_fetal_qrs(fetal_ecg_9, fs, cfg=self.cfg)
+            results["9_Adaptive_Filter_Cleanup"] = _eval(fetal_ecg_9, pks_9_final, "+Adaptive Filter")
+        except Exception as e:
+            self._log(f"  Config 9 failed ({e}) -- skipping")
 
         return results
 

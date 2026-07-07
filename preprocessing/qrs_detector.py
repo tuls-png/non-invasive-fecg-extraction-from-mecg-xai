@@ -1,53 +1,10 @@
 """
 preprocessing/qrs_detector.py
-Pan-Tompkins QRS detector — maternal and fetal variants.
-Also includes a .qrs annotation file loader for ADFECGDB/NIFECGDB ground truth.
 
-DATASET-SPECIFIC CONFIGURATION
-==============================
-By default, uses ADFECGDB base config (FETAL_HR_MIN=100, FETAL_HR_MAX=185).
-To use dataset-specific values from YAML:
-
-  Option 1 — Module-level initialization (affects all subsequent calls):
-    from preprocessing.qrs_detector import initialize_qrs_detector
-    initialize_qrs_detector("cinc2013")  # Loads cinc2013.yaml overrides (e.g., FETAL_HR_MAX=200)
-
-  Option 2 — Per-function config (recommended for pipeline clarity):
-    from configs import get_config
-    cfg = get_config("cinc2013")
-    peaks = detect_fetal_qrs(signal, cfg=cfg)
-
-If a dataset YAML does not define FETAL_HR_MIN/MAX, base.py defaults are used.
-
-CHANGES (per codebase review)
-=============================
-1. Separated maternal and fetal Pan-Tompkins bandpass configurations.
-   - Maternal: 5–15 Hz (standard adult QRS band, order-2 Butterworth).
-   - Fetal:   10–40 Hz (fetal QRS is short-duration and broadband; using
-     5–15 Hz preferentially detects maternal energy that dominates ICA
-     components with residual maternal contamination).
-
-2. FIX — detect_fetal_qrs: added HR gating inside the adaptive threshold
-   loop. Previously the detector lowered its threshold until it found 200
-   peaks, keeping whichever threshold gave the most peaks regardless of
-   whether those peaks had a fetal-range heart rate. At very low thresholds
-   (factor=0.005) this detects T-waves and P-waves from residual maternal
-   signal, producing an apparent "HR" of 130–160 BPM that passes the fetal
-   HR filter downstream — the primary cause of the maternal-ECG extraction
-   failure. The loop now prefers solutions with HR inside FETAL_HR_MIN–MAX.
-
-3. FIX — Butterworth filter order raised from 1 → 2.
-   Order-1 has very poor roll-off (~20 dB/decade); order-2 gives much
-   better stopband rejection (~40 dB/decade) with minimal phase distortion
-   after the filtfilt zero-phase application.
-
-4. Enhanced config system support:
-   - Added initialize_qrs_detector(dataset) for global module configuration.
-   - detect_fetal_qrs() and detect_reference_fetal_qrs() now accept optional
-     config parameter for per-call dataset overrides.
 """
 
 import struct
+import csv
 import wfdb
 import numpy as np
 from pathlib import Path
@@ -62,7 +19,8 @@ FS = _cfg.FS
 PT_MATERNAL_BANDPASS_LOW = _cfg.PT_MATERNAL_BANDPASS_LOW
 PT_MATERNAL_BANDPASS_HIGH = _cfg.PT_MATERNAL_BANDPASS_HIGH
 PT_MATERNAL_BANDPASS_ORDER = _cfg.PT_MATERNAL_BANDPASS_ORDER
-PT_FETAL_BANDPASS_LOW = _cfg.PT_FETAL_BANDPASS_LOWPT_THRESHOLD_FACTOR
+PT_FETAL_BANDPASS_LOW = _cfg.PT_FETAL_BANDPASS_LOW
+PT_THRESHOLD_FACTOR = _cfg.PT_THRESHOLD_FACTOR
 
 
 def initialize_qrs_detector(dataset: str = "adfecgdb"):
@@ -435,6 +393,75 @@ def load_wfdb_annotation(record_stem: str, extension: str = 'qrs') -> np.ndarray
     ann = wfdb.rdann(record_stem, extension)
     return ann.sample
 # ── Utility ───────────────────────────────────────────────────────────────────
+
+# ── Peak-position diagnostic dump ────────────────────────────────────────────
+
+def dump_peak_positions(rec_id: str,
+                         detected_peaks: np.ndarray,
+                         reference_peaks: np.ndarray,
+                         fs: int,
+                         out_dir: str = "peak_dumps",
+                         tolerance_ms: float = 50.0) -> str:
+    """
+    Write a per-peak diagnostic CSV comparing detected vs reference peaks.
+
+    Uses the exact same matching logic as evaluation.metrics.match_peaks, so
+    the TP/FP/FN counts here are the same ones the reported F1 is built from
+    -- this is not a separate/approximate comparison.
+
+    Output columns:
+        peak_type          : 'TP', 'FP', or 'FN'
+        detected_sample     : sample index of the detected peak (TP, FP)
+        detected_time_sec   : detected_sample / fs
+        reference_sample    : sample index of the matched/missed reference peak (TP, FN)
+        offset_ms            : signed (detected - reference) timing error in ms (TP only)
+
+    How to read it for the "HR looks right but F1 is low" cases:
+        - Many TP rows with small, randomly-signed offset_ms (e.g. +/-10-30ms)
+          -> genuine timing jitter/precision noise in the detector or EKF.
+        - Many TP rows with one dominant, consistently-signed offset_ms
+          -> systematic lag/lead (e.g. EKF phase burn-in or filter group delay).
+        - Mostly FP+FN with very few TP despite detected count ~= reference count
+          -> peaks are landing at the wrong phase entirely (e.g. every other
+          beat, or locked onto a maternal harmonic) -- not a jitter problem.
+
+    Returns the path to the written CSV.
+    """
+    from evaluation.metrics import match_peaks
+
+    detected_peaks  = np.asarray(detected_peaks)
+    reference_peaks = np.asarray(reference_peaks)
+
+    match = match_peaks(detected_peaks, reference_peaks, fs=fs, tolerance_ms=tolerance_ms)
+    matched_det = {int(dp) for dp, rp in match["tp_pairs"]}
+    matched_ref = {int(rp) for dp, rp in match["tp_pairs"]}
+
+    rows = []
+    for dp, rp in match["tp_pairs"]:
+        offset_ms = (int(dp) - int(rp)) / fs * 1000.0
+        rows.append(("TP", int(dp), dp / fs, int(rp), round(offset_ms, 2)))
+    for dp in np.sort(detected_peaks):
+        if int(dp) not in matched_det:
+            rows.append(("FP", int(dp), round(dp / fs, 4), "", ""))
+    for rp in np.sort(reference_peaks):
+        if int(rp) not in matched_ref:
+            rows.append(("FN", "", "", int(rp), ""))
+
+    rows.sort(key=lambda r: r[1] if r[1] != "" else r[3])
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    csv_path = out_path / f"{rec_id}_peaks.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["peak_type", "detected_sample", "detected_time_sec",
+                         "reference_sample", "offset_ms"])
+        writer.writerows(rows)
+
+    print(f"[PEAK-DUMP] {rec_id}: {match['TP']} TP, {match['FP']} FP, "
+          f"{match['FN']} FN -> {csv_path}")
+    return str(csv_path)
+
 
 def compute_hr_stats(peaks: np.ndarray, fs: int = FS, cfg: BaseConfig = None) -> dict:
     """

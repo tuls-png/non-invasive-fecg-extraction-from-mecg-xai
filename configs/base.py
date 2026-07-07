@@ -8,6 +8,15 @@ Dataset-specific overrides are applied via YAML configuration files.
 All parameters are stored as class attributes and can be accessed as:
     config = BaseConfig()
     value = config.PARAMETER_NAME
+
+DISSERTATION MODIFICATION [Literature Review / Enhancement Roadmap]:
+  All new hyperparameters introduced by Rank 1-6 of the enhancement
+  roadmap are added below as class-level defaults, each individually
+  overridable via the per-dataset YAML files (configs/<dataset>.yaml)
+  using the same lower-case-key -> UPPER_CASE-attribute convention as
+  every existing parameter. Every new feature is also individually
+  switchable via an *_ENABLED boolean so it can be turned off for
+  ablation studies without touching pipeline.py.
 """
 
 import numpy as np
@@ -86,13 +95,18 @@ class BaseConfig:
         [0.30, 0.20, np.pi / 2],        # T wave
     ])
 
+    # [Rank 5] EKF forward-backward (RTS) smoothing default. Exposed here so
+    # it is a dataset-tunable/ablatable hyperparameter instead of only a
+    # PHASEPipeline constructor argument. PHASEPipeline(use_rts=None) will
+    # fall back to this value; explicit True/False still overrides it.
+    EKF_USE_RTS_DEFAULT = True
+
     # -- Path B ICA2 maternal residual exclusion --------------------------------
     MATERNAL_ICA2_CORR_THRESH = 0.30
 
     # -- Evaluation ---------------------------------------------------------------
     EVAL_TOLERANCE_MS = 50
     EVAL_MIN_PEAK_HEIGHT = 0.35
-    # FIX 3: EVAL_MIN_PEAK_DISTANCE_SEC derived from 60/FETAL_HR_MAX (set in __init__)
     EVAL_MIN_PEAK_DISTANCE_SEC = None  # Computed dynamically in __init__
 
     # -- ECHO XAI -----------------------------------------------------------------
@@ -111,15 +125,106 @@ class BaseConfig:
     HR_SEP_MIN_BPM = 15
 
     # -- Path selection -------------------------------------------------------
-    # Used as SCORE multiplier in Step 9 [FIX-PATH-1]:
+    # Used as SCORE multiplier in Step 9:
     #   Path A chosen when a_score >= b_score * PATH_A_PREFERENCE
     # Default 1.5 for ADFECGDB. cinc2013.yaml overrides to 1.1.
     PATH_A_PREFERENCE = 1.0
 
     # -- Confidence gate ------------------------------------------------------
     # chosen_ic_selection_score < threshold → low_confidence=True in metadata.
-    # [FIX-PATH-2]. Does not suppress output.
     CONFIDENCE_GATE_THRESHOLD = 0.05
+
+    # =====================================================================
+    # [Rank 1] Path C — Adaptive Windowed Weighted SVD, epoch domain
+    # =====================================================================
+    # Path B (separation/wsvd.py) performs adaptive windowed weighted SVD
+    # along the channel x time axis. Path C performs the same underlying
+    # operation -- adaptive, windowed, weighted low-rank decomposition for
+    # maternal-component estimation -- along the beat-epoch x within-beat-
+    # sample axis instead (see separation/template_subtraction.py module
+    # docstring for the full two-axis framing). Estimates a maternal PQRST
+    # template from a local window of aligned beats and subtracts it
+    # directly at each maternal beat location, at a least-squares-optimal
+    # per-beat amplitude scale.
+    PATH_C_ENABLED = True
+    TEMPLATE_HALF_WINDOW_SEC = 0.15      # +/- window around each maternal R-peak
+    TEMPLATE_UPDATE_EVERY_BEATS = 20     # re-estimate template every N beats
+    TEMPLATE_CONTEXT_BEATS = 15          # beats on each side used to build a local template
+    TEMPLATE_MIN_BEATS = 5               # minimum maternal beats required to run Path C
+    # "median": robust (outlier-beat-resistant) estimate of the recurring
+    #   beat shape across the local beat-epoch matrix. Default.
+    # "svd": explicit weighted SVD of the beat-epoch matrix (top
+    #   `TEMPLATE_SVD_N_COMPONENTS` singular modes), the direct epoch-
+    #   domain analogue of Path B's channel-time weighted SVD, and the
+    #   formulation matching Kanjilal, Palit & Saha (1997) TS_SVD.
+    # Compare both via scripts/compare_template_estimators.py before
+    # relying on either in the dissertation write-up.
+    TEMPLATE_ESTIMATOR = "svd"
+    TEMPLATE_SVD_N_COMPONENTS = 1        # used only when TEMPLATE_ESTIMATOR="svd"
+
+    # =====================================================================
+    # [Rank 2] SQI-weighted fusion across Path A / B / C
+    # =====================================================================
+    # Promotes evaluation/sqi.py from a diagnostic role to a first-class
+    # trust-weighting input in path selection (pipeline.py Step 9) and in
+    # IC candidate scoring inside _best_ic_ensemble().
+    SQI_FUSION_ENABLED = True
+    SQI_FUSION_WEIGHT = 0.35             # blend weight of SQI vs raw unified score, in [0, 1]
+    SQI_KURTOSIS_NORM = 20.0             # normalisation constant for the kurtosis sub-score
+    SQI_MIN_QUALITY_THRESH = 0.15        # used by evaluation.sqi.select_best_channels()
+
+    # =====================================================================
+    # [Rank 3] Periodicity-constrained IC scoring
+    # =====================================================================
+    # Adds an autocorrelation-peak-sharpness bonus term to score_fetal_ic()
+    # / score_maternal_ic() in separation/ica.py, following Sameni's
+    # periodic-component-analysis lineage and Kotas et al. (2024).
+    PERIODICITY_SCORE_ENABLED = True
+    PERIODICITY_SCORE_WEIGHT = 1.0       # scales the periodicity bonus contribution
+
+    # =====================================================================
+    # [Rank 4] Adaptive filter (RLS/NLMS) residual cleanup
+    # =====================================================================
+    # Runs after subtract_maternal() and before ICA2, using the AW-WSVD
+    # maternal reconstruction as the adaptive-filter reference signal, to
+    # mop up residual periodic maternal leakage before Path B's ICA stage.
+    ADAPTIVE_FILTER_ENABLED = True
+    ADAPTIVE_FILTER_METHOD = "rls"       # "rls" or "nlms"
+    ADAPTIVE_FILTER_N_TAPS = 5
+    ADAPTIVE_FILTER_FORGETTING = 0.995   # RLS forgetting factor (lambda)
+    ADAPTIVE_FILTER_DELTA = 1.0          # RLS inverse-correlation init constant
+    ADAPTIVE_FILTER_STEP_SIZE = 0.02     # NLMS step size (mu)
+    ADAPTIVE_FILTER_EPS = 1e-6           # NLMS division-by-zero guard
+
+    # =====================================================================
+    # [Rank 7, NEW] QRS-narrowness shape score + cross-path consensus
+    # arbitration
+    # =====================================================================
+    # Targets the "confidently wrong" tail failures: a smooth, periodic,
+    # high-kurtosis, high-autocorrelation non-QRS artifact (breathing
+    # modulation, aliased maternal harmonic, motion) can win the existing
+    # unified score despite not looking like a real QRS complex at the
+    # single-beat level, and Path A / Path C can silently agree on the same
+    # wrong candidate or disagree without either being flagged
+    # low-confidence. Two additive, fully ablatable fixes:
+    #   (1) QRS_NARROWNESS -- an energy-concentration shape score added to
+    #       the unified IC score, alongside kurtosis/periodicity/morphology.
+    #   (2) CONSENSUS_ARBITRATION -- when Path A and Path C disagree in HR
+    #       by more than PATH_DISAGREEMENT_BPM, re-arbitrate between them
+    #       using shape sharpness + the unsupervised spectral HR prior
+    #       (instead of trusting whichever had the higher raw score), and
+    #       always flag the case low_confidence so it is visible rather
+    #       than hidden behind a deceptively acceptable score.
+    QRS_NARROWNESS_ENABLED = True
+    QRS_NARROWNESS_NARROW_MS = 30.0      # QRS-width half-window (ms)
+    QRS_NARROWNESS_WIDE_MS = 150.0       # PQRST half-window (ms), energy denominator
+    QRS_NARROWNESS_WEIGHT = 1.0          # scales the narrowness bonus contribution
+
+    CONSENSUS_ARBITRATION_ENABLED = True
+    PATH_DISAGREEMENT_BPM = 8.0          # |Path A HR - Path C HR| => "in conflict"
+
+    SPECTRAL_PRIOR_CONFIDENCE_MIN = 10.0  # min peakiness to trust expected_fhr prior at all (raised 2026-07 to match fixed confidence formula, was 3.0)
+    SPECTRAL_PRIOR_CONFIDENCE_FULL_TRUST = 25.0  # confidence at which the prior is trusted at full strength; below this it only partially influences arbitration
 
     def __init__(self, dataset: str = "adfecgdb"):
         """
@@ -134,7 +239,7 @@ class BaseConfig:
         self._load_overrides()
         np.random.seed(self.RANDOM_SEED)
         
-        # FIX 3: Compute EVAL_MIN_PEAK_DISTANCE_SEC dynamically from FETAL_HR_MAX
+        # Compute EVAL_MIN_PEAK_DISTANCE_SEC dynamically from FETAL_HR_MAX
         # Minimum peak distance = minimum RR interval = 60 sec / max HR
         if self.EVAL_MIN_PEAK_DISTANCE_SEC is None:
             self.EVAL_MIN_PEAK_DISTANCE_SEC = 60.0 / self.FETAL_HR_MAX

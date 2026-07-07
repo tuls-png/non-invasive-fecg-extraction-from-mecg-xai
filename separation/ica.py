@@ -26,6 +26,21 @@ DISSERTATION MODIFICATION:
           The maternal_penalty and morphology_score factors are computed in
           pipeline.py (_maternal_penalty, _morphology_score) to keep all
           path-specific logic (Path A vs Path B half-weight) in one place.
+
+  [Rank 3, NEW] Periodicity-constrained IC scoring.
+          FastICA's amplitude/kurtosis-based objective is agnostic to the
+          fact that both the maternal and fetal sources are quasi-periodic
+          cardiac signals. `_autocorrelation_periodicity_score()` adds an
+          autocorrelation-peak-sharpness term (following Sameni's periodic
+          component analysis lineage and Kotas et al. 2024's spatio-
+          spectral extension) as an additional multiplicative bonus in
+          both score_maternal_ic() and score_fetal_ic(), folded in the
+          same way the existing kurtosis bonus is. This directly targets
+          the harmonic-confusion / half-HR failure modes that
+          pipeline.py's `_check_harmonic_confusion()` currently only
+          detects post-hoc rather than prevents at the scoring stage.
+          Gated by cfg.PERIODICITY_SCORE_ENABLED so it can be disabled for
+          ablation without touching call sites.
 """
 
 import numpy as np
@@ -91,6 +106,73 @@ def _estimate_dominant_frequency(signal: np.ndarray, fs: int = FS,
     
     dominant_idx = np.argmax(magnitude[band_mask])
     return float(freqs[band_mask][dominant_idx])
+
+
+def _autocorrelation_periodicity_score(signal: np.ndarray, fs: int,
+                                        min_hr_bpm: float,
+                                        max_hr_bpm: float) -> float:
+    """
+    [Rank 3, NEW] Autocorrelation-peak-sharpness periodicity score in [0, 1].
+
+    Computes the normalised autocorrelation of `signal` (via FFT, i.e. the
+    Wiener-Khinchin theorem) and returns its maximum value within the lag
+    range corresponding to [min_hr_bpm, max_hr_bpm]. A signal dominated by
+    a single strong quasi-periodicity in that HR range (e.g. a clean
+    maternal or fetal ECG component) has a sharp autocorrelation peak near
+    1.0 at the beat-to-beat lag; a non-periodic or noise-dominated
+    component has a low, broad autocorrelation with no such peak.
+
+    This is a lightweight post-hoc analogue of Sameni's periodic component
+    analysis (piCA) and the spatio-spectral quasi-periodicity constraint
+    used by Kotas et al. (2024), applied here as a scoring bonus rather
+    than as a constraint on the ICA objective itself (so it requires no
+    change to FastICA's optimisation and remains fully ablatable).
+
+    Parameters
+    ----------
+    signal     : (N,) candidate IC waveform
+    fs         : sampling rate
+    min_hr_bpm : lower bound of the physiologically plausible HR range
+                 (defines the maximum lag considered)
+    max_hr_bpm : upper bound of the physiologically plausible HR range
+                 (defines the minimum lag considered)
+
+    Returns
+    -------
+    score : float in [0, 1]
+    """
+    N = len(signal)
+    if N < 4 or max_hr_bpm <= 0 or min_hr_bpm <= 0:
+        return 0.0
+
+    sig = signal - np.mean(signal)
+    denom = float(np.dot(sig, sig))
+    if denom < 1e-12:
+        return 0.0
+
+    min_lag = max(1, int(round(fs * 60.0 / max_hr_bpm)))
+    max_lag = int(round(fs * 60.0 / min_hr_bpm))
+    max_lag = min(max_lag, N - 1)
+    if min_lag >= max_lag:
+        return 0.0
+
+    # FFT-based autocorrelation (Wiener-Khinchin): O(N log N) instead of the
+    # O(N * lag_range) direct computation, which matters here because
+    # max_lag can be ~1000+ samples at 1 kHz for low maternal HRs.
+    n_fft = 1
+    while n_fft < 2 * N:
+        n_fft *= 2
+    spec = np.fft.rfft(sig, n=n_fft)
+    acf_full = np.fft.irfft(spec * np.conj(spec), n=n_fft)[:N]
+    acf_norm = acf_full / (denom + 1e-12)
+
+    window = acf_norm[min_lag:max_lag + 1]
+    if window.size == 0:
+        return 0.0
+
+    peak_val = float(np.max(window))
+    peak_val = max(0.0, peak_val)  # negative correlation contributes nothing
+    return float(np.clip(peak_val, 0.0, 1.0))
 
 
 def _get_cfg(cfg: BaseConfig = None) -> BaseConfig:
@@ -214,8 +296,10 @@ def score_maternal_ic(ic: np.ndarray, fs: int = FS,
     [FIX-3] Uses _detect_peaks_adaptive() with progressive threshold relaxation
             so that noisy NIFECGDB components (where PT_THRESHOLD_FACTOR=1.0
             finds no peaks at all) still get a meaningful score.
+    [Rank 3] Adds an autocorrelation-periodicity bonus alongside the
+            existing kurtosis bonus, gated by cfg.PERIODICITY_SCORE_ENABLED.
 
-    Score = regularity * peak_completeness * (1 + kurtosis_bonus)
+    Score = regularity * peak_completeness * (1 + kurtosis_bonus + periodicity_bonus)
     """
     cfg = _get_cfg(cfg)
     peaks, mean_hr = _detect_peaks_adaptive(
@@ -248,7 +332,17 @@ def score_maternal_ic(ic: np.ndarray, fs: int = FS,
     kurt       = float(kurtosis(ic, fisher=True))
     kurt_score = np.clip(kurt / 20.0, 0.0, 1.0)
 
-    return float(regularity_score * peak_ratio * (1.0 + kurt_score))
+    # [Rank 3, NEW] Periodicity bonus: rewards ICs whose autocorrelation has
+    # a sharp peak in the maternal HR lag range, independent of amplitude
+    # statistics.
+    periodicity_score = 0.0
+    if getattr(cfg, "PERIODICITY_SCORE_ENABLED", False):
+        periodicity_score = _autocorrelation_periodicity_score(
+            ic, fs, min_hr_bpm=cfg.MATERNAL_HR_MIN, max_hr_bpm=cfg.MATERNAL_HR_MAX
+        ) * getattr(cfg, "PERIODICITY_SCORE_WEIGHT", 1.0)
+
+    return float(regularity_score * peak_ratio *
+                 (1.0 + kurt_score + periodicity_score))
 
 
 def select_maternal_ic(ICs: np.ndarray, fs: int = FS,
@@ -287,8 +381,10 @@ def score_fetal_ic(ic: np.ndarray, maternal_peaks: np.ndarray,
     [FIX-3] Uses _detect_peaks_adaptive() for robust peak finding on noisy
             ICA2 residual components.
     [FIX-5] HR lower bound: 60 -> FETAL_HR_MIN (100 BPM).
+    [Rank 3] Adds an autocorrelation-periodicity bonus alongside the
+            existing kurtosis bonus, gated by cfg.PERIODICITY_SCORE_ENABLED.
 
-    Score = independence * regularity * (1 + kurtosis_bonus)
+    Score = independence * regularity * (1 + kurtosis_bonus + periodicity_bonus)
     """
     cfg = _get_cfg(cfg)
     peaks, mean_hr = _detect_peaks_adaptive(
@@ -323,7 +419,15 @@ def score_fetal_ic(ic: np.ndarray, maternal_peaks: np.ndarray,
     kurt       = float(kurtosis(ic, fisher=True))
     kurt_score = np.clip(kurt / 20.0, 0.0, 1.0)
 
-    return float(independence * regularity * (1.0 + kurt_score))
+    # [Rank 3, NEW] Periodicity bonus in the fetal HR lag range.
+    periodicity_score = 0.0
+    if getattr(cfg, "PERIODICITY_SCORE_ENABLED", False):
+        periodicity_score = _autocorrelation_periodicity_score(
+            ic, fs, min_hr_bpm=cfg.FETAL_HR_MIN, max_hr_bpm=cfg.FETAL_HR_MAX
+        ) * getattr(cfg, "PERIODICITY_SCORE_WEIGHT", 1.0)
+
+    return float(independence * regularity *
+                 (1.0 + kurt_score + periodicity_score))
 
 
 def select_fetal_ic(ICs: np.ndarray,
